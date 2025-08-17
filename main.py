@@ -1,26 +1,24 @@
-# main.py (v2, GPU/NVENC-ready, normalización previa y orquestación limpia)
-
+# main.py (pipeline optimizado: trim primero, luego escala/crop)
 import os
 import sys
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# === Componentes (los actualizaremos enseguida) ===
+# === Componentes propios ===
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import (
-    extract_audio_wav,         # nuevo: ffmpeg a WAV 16k mono
-    normalize_video_9x16_base, # nuevo: scale=-2:1920 + yuv420p (+ NVENC)
-    trim_video_ffmpeg,         # nuevo: recorte por -ss/-to (NVENC)
+    extract_audio_wav,         # ffmpeg → WAV 16k mono (desde .m4a/.webm/.mp4)
+    trim_video_ffmpeg,         # recorte rápido (fast-seek) y opción de -c copy
 )
 from Components.Transcription import transcribeAudio
 from Components.LanguageTasks import GetHighlight
 from Components.FaceCrop import (
-    crop_follow_face_1080x1920, # nuevo: crop vertical estable solo en X
-    mux_audio_video_nvenc,      # nuevo: combina video sin audio + audio (NVENC)
+    crop_follow_face_1080x1920,  # crop vertical estable (1080x1920) con seguimiento en X
+    mux_audio_video_nvenc,        # reinyecta audio del recorte al video cropeado (NVENC)
 )
 
-# =============== Config básica ===============
+# ========== Configuración ==========
 load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
@@ -28,103 +26,138 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-# Carpetas de trabajo
 ROOT = Path(__file__).parent
 WORK = ROOT / "work"
 OUT  = ROOT / "out"
 WORK.mkdir(exist_ok=True)
 OUT.mkdir(exist_ok=True)
 
+
+# ========= Utilidades =========
 def build_transcript_string(transcriptions):
     """
-    Convierte la lista [[text, start, end], ...] en un string lineal
-    que conserva timestamps (como tu main original).
+    Convierte [[text, start, end], ...] en un string lineal (conserva timestamps)
+    para alimentar el selector de highlight.
     """
     chunks = []
     for text, start, end in transcriptions:
-        chunks.append(f"{start} - {end}: {text}")
+        chunks.append(f"{start} - {end}: {text}\n")
     return "".join(chunks)
 
+def guess_companion_audio(final_mp4: Path) -> Path | None:
+    """
+    Intenta ubicar el audio descargado (audio_*.m4a o audio_*.webm) dentro de la
+    misma carpeta del video para acelerar el ASR (evita decodificar desde el MP4).
+    """
+    folder = final_mp4.parent
+    cands = sorted(list(folder.glob("audio_*.*")))
+    return cands[0] if cands else None
+
+def make_project_dirs(final_mp4: Path) -> tuple[Path, Path]:
+    """
+    Crea subcarpetas work/out específicas para el video:
+      work/<basename>/, out/<basename>/
+    """
+    base = final_mp4.stem  # p.ej. 25_08_17_nodal_rompe_el_silencio
+    wdir = WORK / base
+    odir = OUT / base
+    wdir.mkdir(parents=True, exist_ok=True)
+    odir.mkdir(parents=True, exist_ok=True)
+    return wdir, odir
+
+
+# ========= Flujo principal =========
 def main():
     try:
-        # 1) Ingesta: URL → descarga en videos/
+        # 1) Ingesta
         url = input("Enter YouTube video URL: ").strip()
-        src_path = download_youtube_video(url)  # devuelve ruta al MP4 final en videos/
-        if not src_path or not Path(src_path).exists():
+        final_path_str = download_youtube_video(url)  # retorna .../videos/<base>/<base>.mp4
+        if not final_path_str or not Path(final_path_str).exists():
             logging.error("Unable to Download the video")
             return
 
-        logging.info(f"Downloaded video at: {src_path}")
+        final_mp4 = Path(final_path_str)
+        logging.info(f"Downloaded video at: {final_mp4}")
 
-        # 2) Normalización (clave para evitar alturas impares y jitter)
-        #    - Altura fija 1920 (9:16-ready)
-        #    - Formato yuv420p (evita problemas de libx264/h264_nvenc)
-        normalized = WORK / "normalized.mp4"
-        normalize_video_9x16_base(src=str(src_path), dst=str(normalized), fps=30)
-        logging.info(f"Normalized master: {normalized}")
+        # Subcarpetas dedicadas a este video
+        wdir, odir = make_project_dirs(final_mp4)
+        logging.info(f"Work dir: {wdir}")
+        logging.info(f"Out  dir: {odir}")
 
-        # 3) Extraer audio WAV 16k mono (mejor para ASR/VAD)
-        wav_path = WORK / "audio.wav"
-        extract_audio_wav(src=str(normalized), wav=str(wav_path))
+        # 2) Extraer audio para ASR (preferir el audio descargado si existe)
+        companion_audio = guess_companion_audio(final_mp4)
+        audio_src = companion_audio if companion_audio else final_mp4
+        wav_path = wdir / "audio.wav"
+        extract_audio_wav(src=str(audio_src), wav=str(wav_path))
         if not wav_path.exists():
-            logging.error("No audio file found")
+            logging.error("No audio file found for ASR")
             return
-        logging.info(f"Audio extracted: {wav_path}")
+        logging.info(f"Audio for ASR: {wav_path}")
 
-        # 4) Transcripción (GPU si disponible)
-        #    Nota: ajustaremos Transcription.py para usar CUDA + float16/int8
+        # 3) Transcripción (GPU si disponible; fallback CPU si falta cuDNN)
         transcriptions = transcribeAudio(str(wav_path))
         if not transcriptions:
-            logging.warning("No transcriptions found")
+            logging.error("Transcription returned empty result")
             return
 
-        # 5) LLM → rango de highlight (por ahora uno; luego soportaremos N cortes)
+        # 4) LLM → highlight (start, end) en segundos
         trans_text = build_transcript_string(transcriptions)
         start_sec, end_sec = GetHighlight(trans_text)
-        if start_sec == 0 and end_sec == 0:
-            logging.error("Error in getting highlight")
+        if not (isinstance(start_sec, (int, float)) and isinstance(end_sec, (int, float)) and end_sec > start_sec):
+            logging.error(f"Invalid highlight window: start={start_sec}, end={end_sec}")
             return
+        logging.info(f"Highlight → start={start_sec:.3f}s, end={end_sec:.3f}s")
 
-        logging.info(f"Highlight chosen → Start: {start_sec} s, End: {end_sec} s")
+        # 5) Recortar PRIMERO del original (más rápido). Intentar -c copy si solo queremos aislar.
+        #    Nota: si luego vamos a escalar/cropear con OpenCV, igual habrá un re-encode. Aun así,
+        #          recortar primero ahorra muchísimo tiempo.
+        cut_path = wdir / "cut.mp4"
+        # Intento 1: fast-seek + copy (si contenedor/codec lo permite). Si falla, el helper lanza y capturamos para caer al encode.
+        try:
+            trim_video_ffmpeg(
+                src=str(final_mp4),
+                dst=str(cut_path),
+                start=float(start_sec),
+                end=float(end_sec),
+                copy=True  # prueba copy primero (rápido)
+            )
+            logging.info("Temporal cut exported with -c copy (fast).")
+        except Exception as e:
+            logging.warning(f"Fast copy trim failed ({e}). Retrying with re-encode.")
+            trim_video_ffmpeg(
+                src=str(final_mp4),
+                dst=str(cut_path),
+                start=float(start_sec),
+                end=float(end_sec),
+                copy=False  # recorta re-encode (NVENC/libx264 según disponibilidad)
+            )
+            logging.info("Temporal cut exported with re-encode.")
 
-        # 6) Recorte temporal del master normalizado (NVENC)
-        out_cut = WORK / "cut.mp4"
-        trim_video_ffmpeg(
-            src=str(normalized),
-            dst=str(out_cut),
-            start=float(start_sec),
-            end=float(end_sec),
-            fps=30
-        )
-        logging.info(f"Temporal cut exported: {out_cut}")
-
-        # 7) Crop vertical 1080x1920 con seguimiento en X
-        #    (evita "Frame size inconsistant", mantiene H=1920 y W=1080)
-        cropped = WORK / "cropped.mp4"
+        # 6) Crop vertical 1080x1920 con seguimiento horizontal
+        cropped_path = wdir / "cropped.mp4"
         crop_follow_face_1080x1920(
-            input_path=str(out_cut),
-            output_path=str(cropped)
+            input_path=str(cut_path),
+            output_path=str(cropped_path)
         )
-        logging.info(f"Cropped clip: {cropped}")
+        logging.info(f"Cropped clip: {cropped_path}")
 
-        # 8) Combinar audio (del recorte con audio) con el video cropeado (sin audio)
-        #    Podemos reutilizar el audio del out_cut; si crop quita el audio, lo reinyectamos aquí.
-        final = OUT / "Final.mp4"
+        # 7) Reinyectar audio del recorte al video cropeado (NVENC)
+        final_short = odir / "Final.mp4"
         mux_audio_video_nvenc(
-            video_with_audio=str(out_cut),
-            video_without_audio=str(cropped),
-            dst=str(final),
+            video_with_audio=str(cut_path),
+            video_without_audio=str(cropped_path),
+            dst=str(final_short),
             fps=30,
-            v_bitrate="8M"
+            v_bitrate="6M"  # 5–6M suele ser suficiente para talking-head
         )
-        logging.info(f"Final short exported: {final}")
 
-        print(f"\n✅ Done! Short ready at: {final}\n")
+        print(f"\n✅ Done! Short ready at: {final_short}\n")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
+
 
 if __name__ == "__main__":
     main()
