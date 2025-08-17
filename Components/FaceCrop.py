@@ -1,141 +1,216 @@
+# Components/FaceCrop.py
+# Recorte vertical 1080x1920 con seguimiento horizontal estable y combinación de audio (NVENC si disponible).
+
+from __future__ import annotations
+
 import cv2
 import numpy as np
-from moviepy.editor import *
-from Components.Speaker import detect_faces_and_speakers, Frames
-global Fps
+import subprocess
+import shutil
+import os
+from pathlib import Path
+from typing import Tuple, Optional
 
-def crop_to_vertical(input_video_path, output_video_path):
-    detect_faces_and_speakers(input_video_path, "DecOut.mp4")
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-    cap = cv2.VideoCapture(input_video_path, cv2.CAP_FFMPEG)
+W_OUT, H_OUT = 1080, 1920  # Formato Shorts/Reels/TikTok
+
+
+# ---------------------------
+# Utilidades de ffmpeg/NVENC
+# ---------------------------
+
+def _ffmpeg_path() -> str:
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    ff = shutil.which(exe)
+    if not ff:
+        raise EnvironmentError("FFmpeg no encontrado en PATH.")
+    return ff
+
+def _has_nvenc() -> bool:
+    ff = _ffmpeg_path()
+    proc = subprocess.run([ff, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return "h264_nvenc" in proc.stdout
+
+def _v_encoder_flags() -> list[str]:
+    if _has_nvenc():
+        return ["-c:v", "h264_nvenc", "-preset", "p5"]
+    return ["-c:v", "libx264", "-preset", "veryfast"]
+
+
+# -----------------------------------------------------
+# Detección inicial + tracking y recorte 1080x1920
+# -----------------------------------------------------
+
+def _ema(prev: Optional[float], new: float, alpha: float = 0.15) -> float:
+    return new if prev is None else (alpha * new + (1.0 - alpha) * prev)
+
+def _initial_face_bbox(frame: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Devuelve (x, y, w, h) de la cara más grande. Si no hay, centra un bbox genérico.
+    """
+    H, W = frame.shape[:2]
+    # Haar cascade estándar (rápido y sin dependencias extra)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+    if len(faces) == 0:
+        # bbox centrado de emergencia
+        w = min(400, W // 3)
+        h = min(600, H // 2)
+        x = max(0, W // 2 - w // 2)
+        y = max(0, H // 2 - h // 2)
+        return int(x), int(y), int(w), int(h)
+    # cara más grande
+    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
+    return int(x), int(y), int(w), int(h)
+
+def _make_tracker() -> cv2.Tracker:
+    """
+    Crea un tracker rápido y estable. MOSSE es veloz; CSRT es más robusto si MOSSE no está.
+    """
+    tracker = None
+    try:
+        tracker = cv2.legacy.TrackerMOSSE_create()
+    except Exception:
+        pass
+    if tracker is None:
+        try:
+            tracker = cv2.legacy.TrackerCSRT_create()
+        except Exception:
+            pass
+    if tracker is None:
+        raise RuntimeError("No se pudo crear un tracker (MOSSE/CSRT). Instala opencv-contrib-python.")
+    return tracker
+
+
+def crop_follow_face_1080x1920(input_path: str, output_path: str) -> None:
+    """
+    Asume que el video de entrada YA fue normalizado a altura 1920 y formato yuv420p
+    (ver normalize_video_9x16_base en Components/Edit.py).
+    Mantiene H=1920 fija y hace seguimiento SOLO en X para obtener 1080x1920.
+    """
+    cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
-        print("Error: Could not open video.")
-        return
+        raise RuntimeError(f"No se pudo abrir el video: {input_path}")
 
-    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    ok, frame = cap.read()
+    if not ok:
+        cap.release()
+        raise RuntimeError("No se pudo leer el primer frame del video.")
 
-    vertical_height = int(original_height)
-    vertical_width = int(vertical_height * 9 / 16)
-    print(vertical_height, vertical_width)
+    H, W = frame.shape[:2]
 
+    # Si no está a 1920 de alto, reescala (caso defensivo, lo ideal es normalizar antes)
+    if H != H_OUT:
+        scale = H_OUT / float(H)
+        newW = int(round(W * scale / 2) * 2)  # forzamos par
+        frame = cv2.resize(frame, (newW, H_OUT), interpolation=cv2.INTER_AREA)
+        W, H = frame.shape[1], frame.shape[0]
 
-    if original_width < vertical_width:
-        print("Error: Original video width is less than the desired vertical width.")
-        return
+    # Detección inicial + tracker
+    x, y, w, h = _initial_face_bbox(frame)
+    tracker = _make_tracker()
+    tracker.init(frame, (x, y, w, h))
 
-    x_start = (original_width - vertical_width) // 2
-    x_end = x_start + vertical_width
-    print(f"start and end - {x_start} , {x_end}")
-    print(x_end-x_start)
-    half_width = vertical_width // 2
+    # Posición horizontal suavizada
+    cx_smooth: Optional[float] = None
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (vertical_width, vertical_height))
-    global Fps
-    Fps = fps
-    print(fps)
-    count = 0
-    for _ in range(total_frames):
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Could not read frame.")
+    # writer con dimensiones fijas 1080x1920
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")  # mp4 compatible
+    out = cv2.VideoWriter(output_path, fourcc, fps, (W_OUT, H_OUT))
+
+    # y0 fijo para usar toda la altura (si H==1920 → y0=0)
+    if H < H_OUT:
+        # letterbox vertical si viniera más bajo (poco probable si normalizaste)
+        y0 = 0
+    else:
+        y0 = (H - H_OUT) // 2  # centra verticalmente si H>1920 (raro)
+
+    # procesar primer frame ya leído
+    def _process_and_write(f):
+        nonlocal cx_smooth
+        ok_t, bb = tracker.update(f)
+        if ok_t:
+            x_t, y_t, w_t, h_t = map(int, bb)
+            cx = x_t + w_t / 2.0
+        else:
+            cx = W / 2.0  # fallback si se pierde tracking
+
+        cx_smooth = _ema(cx_smooth, cx, alpha=0.15)
+        x0 = int(round(cx_smooth - W_OUT / 2.0))
+        x0 = max(0, min(x0, W - W_OUT))  # clamp dentro del ancho
+
+        crop = f[y0:y0 + H_OUT, x0:x0 + W_OUT]
+        if crop.shape[0] != H_OUT or crop.shape[1] != W_OUT:
+            # defensa extra ante bordes
+            crop = cv2.copyMakeBorder(
+                crop, 0, max(0, H_OUT - crop.shape[0]), 0, max(0, W_OUT - crop.shape[1]),
+                cv2.BORDER_REPLICATE
+            )
+            crop = crop[:H_OUT, :W_OUT]
+        out.write(crop)
+
+    _process_and_write(frame)
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
             break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        if len(faces) >-1:
-            if len(faces) == 0:
-                (x, y, w, h) = Frames[count]
-
-            # (x, y, w, h) = faces[0]  
-            try:
-                #check if face 1 is active
-                (X, Y, W, H) = Frames[count]
-            except Exception as e:
-                print(e)
-                (X, Y, W, H) = Frames[count][0]
-                print(Frames[count][0])
-            
-            for f in faces:
-                x1, y1, w1, h1 = f
-                center = x1+ w1//2
-                if center > X and center < X+W:
-                    x = x1
-                    y = y1
-                    w = w1
-                    h = h1
-                    break
-
-            # print(faces[0])
-            centerX = x+(w//2)
-            print(centerX)
-            print(x_start - (centerX - half_width))
-            if count == 0 or (x_start - (centerX - half_width)) <1 :
-                ## IF dif from prev fram is low then no movement is done
-                pass #use prev vals
-            else:
-                x_start = centerX - half_width
-                x_end = centerX + half_width
-
-
-                if int(cropped_frame.shape[1]) != x_end- x_start:
-                    if x_end < original_width:
-                        x_end += int(cropped_frame.shape[1]) - (x_end-x_start)
-                        if x_end > original_width:
-                            x_start -= int(cropped_frame.shape[1]) - (x_end-x_start)
-                    else:
-                        x_start -= int(cropped_frame.shape[1]) - (x_end-x_start)
-                        if x_start < 0:
-                            x_end += int(cropped_frame.shape[1]) - (x_end-x_start)
-                    print("Frame size inconsistant")
-                    print(x_end- x_start)
-
-        count += 1
-        cropped_frame = frame[:, x_start:x_end]
-        if cropped_frame.shape[1] == 0:
-            x_start = (original_width - vertical_width) // 2
-            x_end = x_start + vertical_width
-            cropped_frame = frame[:, x_start:x_end]
-        
-        print(cropped_frame.shape)
-
-        out.write(cropped_frame)
+        # mantener resolución constante si hubo rarezas
+        if frame.shape[0] != H or frame.shape[1] != W:
+            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
+        _process_and_write(frame)
 
     cap.release()
     out.release()
-    print("Cropping complete. The video has been saved to", output_video_path, count)
 
 
+# -----------------------------------------------------
+# Combinar audio de un clip con video cropeado (NVENC)
+# -----------------------------------------------------
 
-def combine_videos(video_with_audio, video_without_audio, output_filename):
-    try:
-        # Load video clips
-        clip_with_audio = VideoFileClip(video_with_audio)
-        clip_without_audio = VideoFileClip(video_without_audio)
+def mux_audio_video_nvenc(video_with_audio: str, video_without_audio: str, dst: str,
+                          fps: int = 30, v_bitrate: str = "8M", a_bitrate: str = "160k") -> None:
+    """
+    Inyecta el audio de `video_with_audio` en `video_without_audio` re-codificando el video con NVENC si está disponible.
+    Útil cuando el paso de crop en OpenCV pierde/omite el audio.
+    """
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    ff = _ffmpeg_path()
+    venc = _v_encoder_flags()
 
-        audio = clip_with_audio.audio
-
-        combined_clip = clip_without_audio.set_audio(audio)
-
-        global Fps
-        combined_clip.write_videofile(output_filename, codec='libx264', audio_codec='aac', fps=Fps, preset='medium', bitrate='3000k')
-        print(f"Combined video saved successfully as {output_filename}")
-    
-    except Exception as e:
-        print(f"Error combining video and audio: {str(e)}")
-
+    cmd = [
+        ff, "-y",
+        "-i", video_without_audio,  # video
+        "-i", video_with_audio,     # audio donor
+        "-map", "0:v:0", "-map", "1:a:0",
+        *venc,
+        "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", str(int(int(v_bitrate.rstrip('M')) * 2)) + "M",
+        "-r", str(fps),
+        "-c:a", "aac", "-b:a", a_bitrate,
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        dst,
+    ]
+    print("[ffmpeg] " + " ".join(cmd))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"FFmpeg error ({proc.returncode}):\n{proc.stdout}")
+    tail = "\n".join(proc.stdout.splitlines()[-10:])
+    if tail.strip():
+        print(tail)
 
 
 if __name__ == "__main__":
-    input_video_path = r'Out.mp4'
-    output_video_path = 'Croped_output_video.mp4'
-    final_video_path = 'final_video_with_audio.mp4'
-    detect_faces_and_speakers(input_video_path, "DecOut.mp4")
-    crop_to_vertical(input_video_path, output_video_path)
-    combine_videos(input_video_path, output_video_path, final_video_path)
+    # Prueba manual rápida (ajusta rutas)
+    demo_in = "work/cut.mp4"          # clip con audio
+    cropped = "work/cropped.mp4"      # salida de crop_follow_face_1080x1920() (sin audio)
+    final = "out/Final.mp4"
 
-
-
+    if Path(demo_in).exists():
+        crop_follow_face_1080x1920(demo_in, cropped)
+        mux_audio_video_nvenc(video_with_audio=demo_in, video_without_audio=cropped, dst=final)
+        print("OK:", final)
+    else:
+        print("Coloca un clip en work/cut.mp4 para probar.")
