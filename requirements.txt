@@ -1,8 +1,5 @@
 faster-whisper==1.*
 ctranslate2==4.4.0
-ffmpeg==1.4
-ffmpeg-python==0.2.0
-moviepy==1.0.3
 numpy==1.26.0
 opencv-python==4.9.0.80
 opencv_python_headless==4.9.0.80
@@ -11,7 +8,9 @@ pytubefix
 torch==2.4.*      # cu124 (instálalo con el index-url de PyTorch CUDA)
 torchvision==0.19.*
 torchaudio==2.4.*
-webrtcvad-wheels
-pydub
 openai==1.44.1
+rich>=13.0.0
+ultralytics>=8.0.0 # Added for YOLO
+pyannote.audio>=3.0.0 # Added for diarization (optional)
+# Removed: ffmpeg, ffmpeg-python, moviepy, webrtcvad-wheels, pydub (not directly imported/used as Python packages)
 --extra-index-url https://download.pytorch.org/whl/cu121
