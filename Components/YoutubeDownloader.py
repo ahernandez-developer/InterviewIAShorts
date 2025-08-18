@@ -1,116 +1,120 @@
-# Components/YoutubeDownloader.py  (v3 con subcarpetas por video)
-import os, re, shutil, subprocess
+# Components/YoutubeDownloader.py
+from __future__ import annotations
+import os
+import re
+import unicodedata
 from pathlib import Path
+from datetime import datetime
+import logging
 
-from Components.SafeName import safe_name
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from pytubefix import YouTube
+from pytubefix.cli import on_progress
 
-def clean_filename(s: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]', '', s)
+from Components.common_ffmpeg import run_ffmpeg_with_progress
 
-def get_video_size(stream):
-    try:
-        return stream.filesize / (1024 * 1024)
-    except Exception:
-        return 0.0
+def _safe_slug(text: str, maxlen: int = 32) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
+    return text[:maxlen] if maxlen > 0 else text
 
-def _ffmpeg_path() -> str:
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    ff = shutil.which(exe)
-    if not ff:
-        raise EnvironmentError("FFmpeg no encontrado en PATH.")
-    return ff
+def _date_prefix() -> str:
+    return datetime.now().strftime("%y_%m_%d")
 
-def _has_nvenc() -> bool:
-    ff = _ffmpeg_path()
-    proc = subprocess.run([ff, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    return "h264_nvenc" in proc.stdout
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-def _venc_flags():
-    return ["-c:v", "h264_nvenc", "-preset", "p5"] if _has_nvenc() else ["-c:v", "libx264", "-preset", "veryfast"]
+def _ffmpeg_merge(video_path: Path, audio_path: Path, out_path: Path, try_copy: bool = False):
+    """
+    Funde video+audio. Si try_copy=True intentará -c copy (ideal si ambos son mp4/h264+aac o webm/vp9+opus).
+    Si no, usa NVENC para el video y AAC para audio.
+    """
+    # Detecta por extensión: muy simple pero suele funcionar
+    vext = video_path.suffix.lower()
+    aext = audio_path.suffix.lower()
 
-def _run(cmd):
-    print("[ffmpeg] " + " ".join(cmd))
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"FFmpeg error ({p.returncode}):\n{p.stdout}")
-    tail = "\n".join(p.stdout.splitlines()[-10:])
-    if tail.strip():
-        print(tail)
+    if try_copy and (
+        (vext == ".mp4" and aext in (".m4a", ".mp4")) or
+        (vext == ".webm" and aext == ".webm")
+    ):
+        # Muxeamos con copy (rapidísimo)
+        cmd = [
+            "ffmpeg", "-i", str(video_path), "-i", str(audio_path),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(out_path)
+        ]
+        run_ffmpeg_with_progress(cmd, total_duration=None, label="Merge(copy)")
+        return
 
-def download_youtube_video(url):
-    try:
-        yt = YouTube(url)
-        raw_title = yt.title
-        base_name  = safe_name(raw_title)
+    # Re-encode de video (NVENC) + audio AAC
+    cmd = [
+        "ffmpeg", "-hwaccel", "auto",
+        "-i", str(video_path),
+        "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "h264_nvenc", "-preset", "p5",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart",
+        str(out_path)
+    ]
+    run_ffmpeg_with_progress(cmd, total_duration=None, label="Merge(nvenc)")
 
-        video_streams = yt.streams.filter(type="video").order_by('resolution').desc()
-        audio_stream = yt.streams.filter(only_audio=True).first()
+def download_youtube_video(url: str) -> str | None:
+    """
+    Descarga video+audio, guarda en subcarpeta por video y devuelve el MP4 final fusionado.
+    Naming: YY_MM_DD_<short_desc> (sin acentos ni caracteres raros).
+    """
+    yt = YouTube(url, on_progress_callback=on_progress)
+    title = yt.title or "video"
+    short_desc = _safe_slug(title, 28)
+    base = f"{_date_prefix()}_{short_desc}"
 
-        print("Available video streams:")
-        for i, stream in enumerate(video_streams):
-            size = get_video_size(stream)
-            stream_type = "Progressive" if stream.is_progressive else "Adaptive"
-            print(f"{i}. Resolution: {stream.resolution}, Size: {size:.2f} MB, Type: {stream_type}")
+    base_dir = Path("videos") / base
+    _ensure_dir(base_dir)
 
-        choice = int(input("Enter the number of the video stream to download: "))
-        selected_stream = video_streams[choice]
+    # Mostrar opciones de streams
+    streams = yt.streams
+    video_streams = [s for s in streams if s.type == "video"]
+    audio_streams = [s for s in streams if s.type == "audio"]
 
-        # === nueva subcarpeta por video ===
-        base_dir = Path('videos')
-        video_dir = base_dir / base_name
-        video_dir.mkdir(parents=True, exist_ok=True)
+    print("Available video streams:")
+    idx = 0
+    for s in video_streams:
+        kind = "Progressive" if s.is_progressive else "Adaptive"
+        size_mb = (s.filesize or 0) / (1024 * 1024)
+        res = getattr(s, "resolution", None) or f"{getattr(s, 'height', '?')}p"
+        print(f"{idx}. Resolution: {res}, Size: {size_mb:.2f} MB, Type: {kind}")
+        idx += 1
 
-        print(f"Downloading video: {raw_title!r}")
-        tmp_video = selected_stream.download(output_path=str(video_dir), filename_prefix="video_")
-        base, ext = os.path.splitext(tmp_video)
-        new_video_file = video_dir / f"video_{base_name}{ext}"
-        os.replace(tmp_video, new_video_file)
-        video_file = str(new_video_file)
+    choice = int(input("Enter the number of the video stream to download: ").strip())
+    vstream = video_streams[choice]
 
-        if not selected_stream.is_progressive:
-            print("Downloading audio...")
-            tmp_audio = audio_stream.download(output_path=str(video_dir), filename_prefix="audio_")
-            base, aext = os.path.splitext(tmp_audio)
-            new_audio_file = video_dir / f"audio_{base_name}{aext}"
-            os.replace(tmp_audio, new_audio_file)
-            audio_file = str(new_audio_file)
-
-            print("Merging video and audio...")
-            ff = _ffmpeg_path()
-            venc = _venc_flags()
-            output_file = video_dir / f"{base_name}.mp4"
-
-            cmd = [
-                ff, "-y",
-                "-hwaccel", "auto",
-                "-i", video_file,
-                "-i", audio_file,
-                "-map", "0:v:0", "-map", "1:a:0",
-                *venc,
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "160k",
-                "-movflags", "+faststart",
-                str(output_file),
-            ]
-            _run(cmd)
-
-            # limpia temporales
-            os.remove(video_file)
-            os.remove(audio_file)
-            final_path = str(output_file)
-        else:
-            final_path = video_file
-
-        print(f"Downloaded: {raw_title!r} to {video_dir} as {os.path.basename(final_path)}")
-        return final_path
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        print("Try: pip install --upgrade pytubefix ffmpeg-python")
+    # Preferimos audio/webm si hay (por copy con webm/vp9); si no, el primero disponible
+    audio_webm = next((a for a in audio_streams if "webm" in (a.mime_type or "")), None)
+    astream = audio_webm or (audio_streams[0] if audio_streams else None)
+    if astream is None:
+        logging.error("No audio stream found.")
         return None
 
-if __name__ == "__main__":
-    youtube_url = input("Enter YouTube video URL: ")
-    download_youtube_video(youtube_url)
+    video_path = base_dir / f"video_{base}{vstream.subtype and '.' + vstream.subtype or '.mp4'}"
+    audio_path = base_dir / f"audio_{base}{astream.subtype and '.' + astream.subtype or '.m4a'}"
+    out_path   = base_dir / f"{base}.mp4"
+
+    print(f"Downloading video: '{yt.title}'")
+    vstream.download(output_path=str(base_dir), filename=video_path.name)
+    print("Downloading audio...")
+    astream.download(output_path=str(base_dir), filename=audio_path.name)
+
+    print("Merging video and audio...")
+    try:
+        # Intentar copy si contenedor/codec compatibles
+        _ffmpeg_merge(video_path, audio_path, out_path, try_copy=True)
+    except Exception as e:
+        logging.warning(f"Merge(copy) failed ({e}), retrying with NVENC.")
+        _ffmpeg_merge(video_path, audio_path, out_path, try_copy=False)
+
+    print(f"Downloaded: '{yt.title}' to {base_dir} as {out_path.name}")
+    logging.info(f"Downloaded video at: {out_path}")
+    return str(out_path)

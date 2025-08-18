@@ -1,216 +1,237 @@
 # Components/FaceCrop.py
-# Recorte vertical 1080x1920 con seguimiento horizontal estable y combinación de audio (NVENC si disponible).
-
 from __future__ import annotations
-
+import os
+import math
 import cv2
 import numpy as np
+from pathlib import Path
 import subprocess
 import shutil
-import os
-from pathlib import Path
-from typing import Tuple, Optional
+import sys
+import logging
 
+# =========================
+# Configurables
+# =========================
+OUT_W, OUT_H = 1080, 1920        # Salida vertical 9:16
+DETECT_EVERY_N = 5               # Re-detectar rostro cada N frames (si no hay tracker)
+EMA_ALPHA = 0.15                 # Suavizado para la posición X del recorte
+FACE_SCALE_BOX = 1.35            # Escala bbox de rostro (margen)
+MIN_FACE_SIZE = 64               # Ignorar detecciones muy pequeñas
+FACE_DETECTOR = "haar"           # "haar" (por defecto); si pones "none" hará crop centrado
 
-W_OUT, H_OUT = 1080, 1920  # Formato Shorts/Reels/TikTok
-
-
-# ---------------------------
-# Utilidades de ffmpeg/NVENC
-# ---------------------------
-
+# =========================
+# Utilidades
+# =========================
 def _ffmpeg_path() -> str:
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
     ff = shutil.which(exe)
     if not ff:
         raise EnvironmentError("FFmpeg no encontrado en PATH.")
     return ff
 
-def _has_nvenc() -> bool:
-    ff = _ffmpeg_path()
-    proc = subprocess.run([ff, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    return "h264_nvenc" in proc.stdout
+def _ensure_parent(p: str | Path):
+    Path(p).parent.mkdir(parents=True, exist_ok=True)
 
-def _v_encoder_flags() -> list[str]:
-    if _has_nvenc():
-        return ["-c:v", "h264_nvenc", "-preset", "p5"]
-    return ["-c:v", "libx264", "-preset", "veryfast"]
+def _create_video_writer(path: str, fps: float):
+    # Escribimos H.264 básico desde OpenCV. El MUX final lo hará FFmpeg.
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # compatible
+    return cv2.VideoWriter(path, fourcc, fps, (OUT_W, OUT_H))
 
+def _resize_to_height(frame, target_h=OUT_H):
+    h, w = frame.shape[:2]
+    scale = target_h / float(h)
+    new_w = int(round(w * scale))
+    resized = cv2.resize(frame, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
+    return resized, new_w, target_h, scale
 
-# -----------------------------------------------------
-# Detección inicial + tracking y recorte 1080x1920
-# -----------------------------------------------------
+def _clamp(val, lo, hi):
+    return max(lo, min(hi, val))
 
-def _ema(prev: Optional[float], new: float, alpha: float = 0.15) -> float:
-    return new if prev is None else (alpha * new + (1.0 - alpha) * prev)
+def _load_haar():
+    # Haar cascades vienen con opencv-python (no necesita contrib)
+    haar_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    if not Path(haar_path).exists():
+        raise RuntimeError("No se encontró haarcascade_frontalface_default.xml")
+    return cv2.CascadeClassifier(haar_path)
 
-def _initial_face_bbox(frame: np.ndarray) -> Tuple[int, int, int, int]:
-    """
-    Devuelve (x, y, w, h) de la cara más grande. Si no hay, centra un bbox genérico.
-    """
-    H, W = frame.shape[:2]
-    # Haar cascade estándar (rápido y sin dependencias extra)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+def _detect_face_haar(gray, min_size=MIN_FACE_SIZE):
+    faces = HAAR.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(min_size, min_size))
     if len(faces) == 0:
-        # bbox centrado de emergencia
-        w = min(400, W // 3)
-        h = min(600, H // 2)
-        x = max(0, W // 2 - w // 2)
-        y = max(0, H // 2 - h // 2)
-        return int(x), int(y), int(w), int(h)
-    # cara más grande
+        return None
+    # Tomar la cara más grande (asume primer plano)
     x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-    return int(x), int(y), int(w), int(h)
+    return (int(x), int(y), int(w), int(h))
 
-def _make_tracker() -> cv2.Tracker:
-    """
-    Crea un tracker rápido y estable. MOSSE es veloz; CSRT es más robusto si MOSSE no está.
-    """
-    tracker = None
-    try:
-        tracker = cv2.legacy.TrackerMOSSE_create()
-    except Exception:
-        pass
-    if tracker is None:
-        try:
-            tracker = cv2.legacy.TrackerCSRT_create()
-        except Exception:
-            pass
-    if tracker is None:
-        raise RuntimeError("No se pudo crear un tracker (MOSSE/CSRT). Instala opencv-contrib-python.")
-    return tracker
+def _expand_bbox(x, y, w, h, scale, W, H):
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+    nw = w * scale
+    nh = h * scale
+    x1 = int(round(cx - nw / 2))
+    y1 = int(round(cy - nh / 2))
+    x2 = int(round(cx + nw / 2))
+    y2 = int(round(cy + nh / 2))
+    x1 = _clamp(x1, 0, W - 1)
+    y1 = _clamp(y1, 0, H - 1)
+    x2 = _clamp(x2, x1 + 1, W)
+    y2 = _clamp(y2, y1 + 1, H)
+    return x1, y1, x2 - x1, y2 - y1
 
+def _make_tracker():
+    # Intentar usar contrib si existe (más estable que redetectar)
+    if hasattr(cv2, "legacy"):
+        if hasattr(cv2.legacy, "TrackerMOSSE_create"):
+            return cv2.legacy.TrackerMOSSE_create()
+        if hasattr(cv2.legacy, "TrackerCSRT_create"):
+            return cv2.legacy.TrackerCSRT_create()
+    # Sin contrib: devolvemos None y haremos redetección periódica
+    return None
 
-def crop_follow_face_1080x1920(input_path: str, output_path: str) -> None:
+# Cargar Haar una vez (si está configurado)
+HAAR = _load_haar() if FACE_DETECTOR == "haar" else None
+
+# =========================
+# Pipeline principal
+# =========================
+def crop_follow_face_1080x1920(input_path: str, output_path: str):
     """
-    Asume que el video de entrada YA fue normalizado a altura 1920 y formato yuv420p
-    (ver normalize_video_9x16_base en Components/Edit.py).
-    Mantiene H=1920 fija y hace seguimiento SOLO en X para obtener 1080x1920.
+    1) Reescala frame input a altura 1920 manteniendo AR (ancho suele quedar ~3413 si fuente es 1920x1080)
+    2) Busca rostro (tracker si hay, o Haar cada N frames)
+    3) Suaviza el centro X con EMA para evitar brincos
+    4) Recorta ventana vertical 1080x1920 centrada en la cara (clamp a bordes)
+    5) Escribe mp4 (H.264 básico). El audio se reinyecta luego con FFmpeg en mux_audio_video_nvenc.
     """
-    cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
+    _ensure_parent(output_path)
+    cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir el video: {input_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    ok, frame = cap.read()
-    if not ok:
-        cap.release()
-        raise RuntimeError("No se pudo leer el primer frame del video.")
+    writer = _create_video_writer(output_path, fps)
 
-    H, W = frame.shape[:2]
+    tracker = None
+    has_tracker = False
+    track_bbox = None  # (x,y,w,h) en coordenadas del frame reescalado
 
-    # Si no está a 1920 de alto, reescala (caso defensivo, lo ideal es normalizar antes)
-    if H != H_OUT:
-        scale = H_OUT / float(H)
-        newW = int(round(W * scale / 2) * 2)  # forzamos par
-        frame = cv2.resize(frame, (newW, H_OUT), interpolation=cv2.INTER_AREA)
-        W, H = frame.shape[1], frame.shape[0]
+    smoothed_cx = None  # para suavizado EMA del centro X
 
-    # Detección inicial + tracker
-    x, y, w, h = _initial_face_bbox(frame)
-    tracker = _make_tracker()
-    tracker.init(frame, (x, y, w, h))
-
-    # Posición horizontal suavizada
-    cx_smooth: Optional[float] = None
-
-    # writer con dimensiones fijas 1080x1920
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")  # mp4 compatible
-    out = cv2.VideoWriter(output_path, fourcc, fps, (W_OUT, H_OUT))
-
-    # y0 fijo para usar toda la altura (si H==1920 → y0=0)
-    if H < H_OUT:
-        # letterbox vertical si viniera más bajo (poco probable si normalizaste)
-        y0 = 0
-    else:
-        y0 = (H - H_OUT) // 2  # centra verticalmente si H>1920 (raro)
-
-    # procesar primer frame ya leído
-    def _process_and_write(f):
-        nonlocal cx_smooth
-        ok_t, bb = tracker.update(f)
-        if ok_t:
-            x_t, y_t, w_t, h_t = map(int, bb)
-            cx = x_t + w_t / 2.0
-        else:
-            cx = W / 2.0  # fallback si se pierde tracking
-
-        cx_smooth = _ema(cx_smooth, cx, alpha=0.15)
-        x0 = int(round(cx_smooth - W_OUT / 2.0))
-        x0 = max(0, min(x0, W - W_OUT))  # clamp dentro del ancho
-
-        crop = f[y0:y0 + H_OUT, x0:x0 + W_OUT]
-        if crop.shape[0] != H_OUT or crop.shape[1] != W_OUT:
-            # defensa extra ante bordes
-            crop = cv2.copyMakeBorder(
-                crop, 0, max(0, H_OUT - crop.shape[0]), 0, max(0, W_OUT - crop.shape[1]),
-                cv2.BORDER_REPLICATE
-            )
-            crop = crop[:H_OUT, :W_OUT]
-        out.write(crop)
-
-    _process_and_write(frame)
+    frame_idx = 0
+    ok_count = 0
+    fail_count = 0
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
+        ret, frame = cap.read()
+        if not ret:
             break
-        # mantener resolución constante si hubo rarezas
-        if frame.shape[0] != H or frame.shape[1] != W:
-            frame = cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA)
-        _process_and_write(frame)
+        frame_idx += 1
 
+        # 1) resize to OUT_H
+        frame_rs, W, H, scale = _resize_to_height(frame, OUT_H)
+
+        # 2) tracker o redetección
+        if tracker is None and (HAAR is not None):
+            # redetectar
+            gray = cv2.cvtColor(frame_rs, cv2.COLOR_BGR2GRAY)
+            det = _detect_face_haar(gray)
+            if det and det[2] >= MIN_FACE_SIZE and det[3] >= MIN_FACE_SIZE:
+                x, y, w, h = _expand_bbox(*det, FACE_SCALE_BOX, W, H)
+                # intentar tracker si existe
+                trk = _make_tracker()
+                if trk is not None:
+                    ok = trk.init(frame_rs, (x, y, w, h))
+                    if ok:
+                        tracker = trk
+                        has_tracker = True
+                        track_bbox = (x, y, w, h)
+                    else:
+                        tracker = None
+                        has_tracker = False
+                        track_bbox = (x, y, w, h)  # usaremos redetección periódica
+                else:
+                    # SIN tracker: guardamos bbox y redetectaremos cada N frames
+                    track_bbox = (x, y, w, h)
+            else:
+                # sin detección: centro
+                track_bbox = (W // 2 - 200, H // 2 - 200, 400, 400)
+
+        elif tracker is not None and has_tracker:
+            ok, box = tracker.update(frame_rs)
+            if ok:
+                x, y, w, h = [int(round(v)) for v in box]
+                x, y, w, h = _expand_bbox(x, y, w, h, FACE_SCALE_BOX, W, H)
+                track_bbox = (x, y, w, h)
+                ok_count += 1
+            else:
+                fail_count += 1
+                tracker = None  # forzar redetección
+                # mantenemos último bbox unos frames
+                if track_bbox is None:
+                    track_bbox = (W // 2 - 200, H // 2 - 200, 400, 400)
+
+        else:
+            # SIN tracker: redetectar cada N frames, si no, mantener bbox previo
+            if (frame_idx % DETECT_EVERY_N == 0) and (HAAR is not None):
+                gray = cv2.cvtColor(frame_rs, cv2.COLOR_BGR2GRAY)
+                det = _detect_face_haar(gray)
+                if det and det[2] >= MIN_FACE_SIZE and det[3] >= MIN_FACE_SIZE:
+                    x, y, w, h = _expand_bbox(*det, FACE_SCALE_BOX, W, H)
+                    track_bbox = (x, y, w, h)
+            if track_bbox is None:
+                track_bbox = (W // 2 - 200, H // 2 - 200, 400, 400)
+
+        # 3) target center X suavizado
+        tx, ty, tw, th = track_bbox
+        face_cx = tx + tw / 2.0
+
+        if smoothed_cx is None:
+            smoothed_cx = face_cx
+        else:
+            smoothed_cx = EMA_ALPHA * face_cx + (1 - EMA_ALPHA) * smoothed_cx
+
+        # 4) recorte 1080x1920 a partir del frame reescalado
+        # ventana de ancho OUT_W, alto OUT_H, centrada en smoothed_cx
+        left = int(round(smoothed_cx - OUT_W / 2))
+        left = _clamp(left, 0, W - OUT_W)
+        right = left + OUT_W
+        crop = frame_rs[:, left:right]
+
+        if crop.shape[1] != OUT_W or crop.shape[0] != OUT_H:
+            # llenar con bordes si algo falló
+            canvas = np.zeros((OUT_H, OUT_W, 3), dtype=np.uint8)
+            x_off = (OUT_W - crop.shape[1]) // 2
+            canvas[:, x_off:x_off + crop.shape[1]] = crop
+            crop = canvas
+
+        writer.write(crop)
+
+    writer.release()
     cap.release()
-    out.release()
 
+    logging.info(f"FaceCrop done. Tracker ok={ok_count}, fails={fail_count}, used_tracker={has_tracker}")
 
-# -----------------------------------------------------
-# Combinar audio de un clip con video cropeado (NVENC)
-# -----------------------------------------------------
-
-def mux_audio_video_nvenc(video_with_audio: str, video_without_audio: str, dst: str,
-                          fps: int = 30, v_bitrate: str = "8M", a_bitrate: str = "160k") -> None:
+def mux_audio_video_nvenc(video_with_audio: str, video_without_audio: str, dst: str, fps: int = 30, v_bitrate: str = "6M"):
     """
-    Inyecta el audio de `video_with_audio` en `video_without_audio` re-codificando el video con NVENC si está disponible.
-    Útil cuando el paso de crop en OpenCV pierde/omite el audio.
+    Toma el audio del clip 'video_with_audio' y lo reinyecta en 'video_without_audio' (que viene sin audio).
+    Re-encodea el video con NVENC si hace falta alinear formatos.
     """
-    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    _ensure_parent(dst)
     ff = _ffmpeg_path()
-    venc = _v_encoder_flags()
-
     cmd = [
         ff, "-y",
-        "-i", video_without_audio,  # video
-        "-i", video_with_audio,     # audio donor
+        "-i", video_without_audio,
+        "-i", video_with_audio,
         "-map", "0:v:0", "-map", "1:a:0",
-        *venc,
-        "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", str(int(int(v_bitrate.rstrip('M')) * 2)) + "M",
+        "-c:v", "h264_nvenc", "-preset", "p5",
         "-r", str(fps),
-        "-c:a", "aac", "-b:a", a_bitrate,
+        "-b:v", v_bitrate, "-maxrate", v_bitrate, "-bufsize", "12M",
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart",
-        dst,
+        dst
     ]
-    print("[ffmpeg] " + " ".join(cmd))
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"FFmpeg error ({proc.returncode}):\n{proc.stdout}")
-    tail = "\n".join(proc.stdout.splitlines()[-10:])
-    if tail.strip():
-        print(tail)
-
-
-if __name__ == "__main__":
-    # Prueba manual rápida (ajusta rutas)
-    demo_in = "work/cut.mp4"          # clip con audio
-    cropped = "work/cropped.mp4"      # salida de crop_follow_face_1080x1920() (sin audio)
-    final = "out/Final.mp4"
-
-    if Path(demo_in).exists():
-        crop_follow_face_1080x1920(demo_in, cropped)
-        mux_audio_video_nvenc(video_with_audio=demo_in, video_without_audio=cropped, dst=final)
-        print("OK:", final)
-    else:
-        print("Coloca un clip en work/cut.mp4 para probar.")
+    # Usamos subprocess simple aquí; ya tendrás %/ETA en el Trim/Merge grande.
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"FFmpeg mux failed: {e}")
