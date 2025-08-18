@@ -1,19 +1,24 @@
-# AI Shorts Generator 🎬🤖
+# AI Shorts Generator 🎬🤖 v0.1
 
 > Generador automático de **YouTube Shorts** a partir de videos largos usando Whisper, OpenAI GPT y OpenCV/FFmpeg.  
-Convierte entrevistas o podcasts en clips atractivos en formato vertical listos para subir a TikTok, Reels y Shorts.
+> Convierte entrevistas o podcasts en clips atractivos en formato vertical listos para subir a TikTok, Reels y Shorts.
 
 ---
 
-## 🚀 Características
+## 🚀 Características (v0.1)
 
-- 📥 Descarga de videos desde YouTube u otras fuentes (`yt-dlp`).
-- 📝 Transcripción automática con **Whisper** (soporte multi-idioma).
-- ✂️ Selección inteligente de highlights con **GPT-4**.
-- 🧑‍🤝‍🧑 Detección de speakers y segmentación por turnos de voz.
-- 🎥 Recorte automático a formato **9:16 vertical**, centrando en rostros o áreas relevantes.
-- 📂 Genera un **manifest.json** por corrida con metadatos (timestamps, prompts, scores, modelos usados).
-- 🐳 Compatible con Docker para despliegue en cualquier entorno.
+- 📥 **Descarga de Video:** Soporte para YouTube y otras fuentes mediante `yt-dlp`.
+- 🎙️ **Transcripción Precisa:** Transcripción automática de alta calidad con `faster-whisper`, con timestamps a nivel de palabra.
+- 🧠 **Selección Inteligente:** Uso de **GPT-4** para analizar la transcripción y encontrar el segmento más "viral" o interesante del video.
+- 🗣️ **Diarización de Hablantes:** Detección de quién habla y cuándo, permitiendo crear encuadres fijos por hablante.
+- 🎥 **Cámara Virtual Inteligente:**
+    - **Modo Estático:** Crea planos fijos por hablante con transiciones suaves entre ellos, simulando un cambio de cámara profesional.
+    - **Modo Dinámico:** Si no hay turnos de habla, una cámara virtual sigue al sujeto con paneo y zoom cinematográfico.
+- 🔥 **Subtítulos Dinámicos:**
+    - Generación automática de subtítulos en formato `.ass`.
+    - **Sincronización por Pausas:** Los subtítulos se agrupan y aparecen en pantalla siguiendo el ritmo natural del habla y las pausas del hablante.
+    - **Estilo Viral:** Fuente de alto impacto (Impact), tamaño grande y contorno para máxima legibilidad en móviles.
+- 🐳 **Soporte Docker:** Compatible con Docker para despliegue en cualquier entorno.
 
 ---
 
@@ -21,7 +26,6 @@ Convierte entrevistas o podcasts en clips atractivos en formato vertical listos 
 
 - **Python 3.8+**
 - **FFmpeg** instalado y accesible desde la terminal (`ffmpeg -version`)
-- **OpenCV** con soporte de modelos Haar/SSD
 - **Cuenta de OpenAI** y API Key activa
 
 ---
@@ -42,118 +46,55 @@ venv\Scripts\activate    # en Windows
 pip install -r requirements.txt
 
 # 4. Configurar variables de entorno
-cp .env.example .env
-# Editar .env y colocar tu API key de OpenAI
+# (Crea un archivo .env a partir de .env.example y añade tu API key de OpenAI)
 ```
-
----
-
-## 🔑 Configuración
-
-Archivo `.env`:
-
-```ini
-OPENAI_API_KEY=tu_api_key_aqui
-```
-
-Ejemplo de `.env.example` ya incluido en el repo.
 
 ---
 
 ## ▶️ Uso
 
-Ejecutar el pipeline principal desde la raíz del proyecto:
+El script ahora es interactivo. Simplemente ejecútalo desde la raíz del proyecto:
 
 ```bash
-python main.py --url "https://youtube.com/watch?v=XXXX" --max-clips 5 --outdir ./outputs
+python main.py
 ```
 
-### Parámetros disponibles
-
-| Parámetro       | Descripción |
-|-----------------|-------------|
-| `--url`         | URL del video de YouTube |
-| `--max-clips`   | Número máximo de clips a generar |
-| `--outdir`      | Carpeta de salida (default: `./outputs`) |
-| `--model-size`  | Tamaño del modelo Whisper (`tiny`, `base`, `small`, `medium`, `large`) |
-| `--language`    | Forzar idioma de transcripción (`es`, `en`, etc.) |
+Luego, introduce la URL del video de YouTube cuando se te solicite.
 
 ---
 
-## 📂 Estructura de salida
+## 📂 Estructura de Salida
 
-Cada corrida genera una carpeta con:
+Cada video procesado genera una carpeta en el directorio `out/` con la siguiente estructura:
 
 ```
-outputs/
-└── <video_id>/
-    ├── clips/
-    │   ├── clip_01.mp4
-    │   ├── clip_02.mp4
-    │   └── ...
-    ├── manifest.json
-    ├── transcription.txt
-    └── highlights.json
+out/
+└── <nombre_del_video>/
+    ├── Final.mp4               # Video vertical sin subtítulos
+    ├── Final_subtitled.mp4     # ✅ Video final con subtítulos incrustados
+    └── subtitles.ass           # Archivo de subtítulos dinámicos
 ```
-
-### Ejemplo `manifest.json`
-
-```json
-{
-  "video_id": "abcd1234",
-  "source_url": "https://youtube.com/watch?v=abcd1234",
-  "created_at": "2025-08-17T12:00:00Z",
-  "model": "gpt-4",
-  "whisper_model": "medium",
-  "clips": [
-    {
-      "file": "clip_01.mp4",
-      "start": "00:01:23",
-      "end": "00:02:45",
-      "score": 0.91,
-      "speaker": "Speaker 1",
-      "highlight_text": "Explicación clave del invitado..."
-    }
-  ]
-}
-```
-
----
-
-## 🐳 Uso con Docker
-
-```bash
-# Construir imagen
-docker build -t ai-shorts .
-
-# Ejecutar pipeline
-docker run --rm -it \
-    -v $(pwd)/outputs:/app/outputs \
-    -e OPENAI_API_KEY=$OPENAI_API_KEY \
-    ai-shorts --url "https://youtube.com/watch?v=XXXX"
-```
-
----
-
-## 🔧 Troubleshooting
-
-- **`ffmpeg: command not found`** → Instala FFmpeg:  
-  - Ubuntu: `sudo apt install ffmpeg`  
-  - Mac: `brew install ffmpeg`  
-  - Windows: [descargar binarios](https://ffmpeg.org/download.html)
-
-- **CUDA no disponible** → Whisper correrá en CPU (más lento).
-
-- **API Key inválida** → Verifica tu `.env` y que la cuenta de OpenAI tenga créditos.
+Adicionalmente, la carpeta `work/` contiene archivos intermedios como el audio, la transcripción completa (`speech.json`), etc.
 
 ---
 
 ## 📊 Roadmap
 
-- [ ] Soporte a `faster-whisper` para transcripciones más rápidas.
-- [ ] Generación de subtítulos (`.srt`) y *burn-in* opcional.
-- [ ] UI con Gradio para uso no técnico.
-- [ ] Auto-generación de thumbnails y hashtags.
+### Logros de la v0.1
+
+- [x] Soporte para `faster-whisper` para transcripciones rápidas y precisas.
+- [x] Generación de subtítulos dinámicos en formato `.ass`.
+- [x] Agrupación de subtítulos por pausas naturales del habla.
+- [x] Cámara estática con transiciones suaves entre hablantes.
+- [x] Lógica de recorte de video precisa para evitar desincronización.
+
+### Próximos Pasos (v0.2 y más allá)
+
+- [ ] **Emojis Inteligentes:** Inserción automática de emojis relevantes (💡, 😂, 💰) en los subtítulos para aumentar el engagement.
+- [ ] **Modo Karaoke:** Opción para resaltar palabra por palabra en los subtítulos a medida que se pronuncian.
+- [ ] **UI Web:** Crear una interfaz gráfica con Gradio o Streamlit para un uso no técnico.
+- [ ] **Mejoras de IA:** Auto-generación de títulos, descripciones y hashtags para los clips.
+- [ ] **Personalización:** Permitir configurar fácilmente el estilo de los subtítulos (fuentes, colores, etc.) a través de un archivo de configuración.
 
 ---
 
