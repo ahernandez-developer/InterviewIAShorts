@@ -1,4 +1,3 @@
-# main.py
 import os
 import sys
 import logging
@@ -8,38 +7,34 @@ from dotenv import load_dotenv
 import json
 from typing import List, Dict, Any
 
+# Rich for beautiful CLI
+from rich.console import Console
+from rich.panel import Panel
+from rich.logging import RichHandler
+
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
 from Components.LanguageTasks import GetHighlight
-# En lugar del FaceCrop “clásico”, usa el YOLO/DNN:
 from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo
 from Components.FaceCropYOLO import mux_audio_video_nvenc
 from Components.Subtitles import generate_ass, burn_in_subtitles
 
 load_dotenv()
+
+# --- Rich Console Setup ---
+console = Console()
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    level="INFO",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_time=False)]
 )
+logger = logging.getLogger("rich") # Use rich's logger
 
-ROOT = Path(__file__).parent
-WORK = ROOT / "work"
-OUT  = ROOT / "out"
-WORK.mkdir(exist_ok=True)
-OUT.mkdir(exist_ok=True)
-
+# --- Helper Functions (adapted for Rich) ---
 def hr(title: str):
-    print("\n" + "="*12 + f" {title} " + "="*12)
-
-class StepTimer:
-    def __init__(self, name: str):
-        self.name = name
-        self.t0 = time.time()
-    def end(self):
-        dt = time.time() - self.t0
-        print(f"⏱️  {self.name} completado en {dt:.1f}s")
+    console.print(Panel(f"[bold blue]{title}", expand=False, border_style="blue"))
 
 def build_transcript_string(transcriptions: List[Dict[str, Any]]):
     chunks = []
@@ -53,6 +48,7 @@ def build_transcript_string(transcriptions: List[Dict[str, Any]]):
 def guess_companion_audio(final_mp4: Path) -> Path | None:
     folder = final_mp4.parent
     cands = sorted(list(folder.glob("audio_*.* Willow")))
+    # Added a check for empty list to prevent IndexError
     return cands[0] if cands else None
 
 def make_project_dirs(final_mp4: Path) -> tuple[Path, Path]:
@@ -63,146 +59,144 @@ def make_project_dirs(final_mp4: Path) -> tuple[Path, Path]:
     odir.mkdir(parents=True, exist_ok=True)
     return wdir, odir
 
+# --- Main Pipeline ---
+ROOT = Path(__file__).parent
+WORK = ROOT / "work"
+OUT  = ROOT / "out"
+WORK.mkdir(exist_ok=True)
+OUT.mkdir(exist_ok=True)
+
 def main():
     try:
-        hr("Descarga")
-        url = input("Enter YouTube video URL: ").strip()
-        st = StepTimer("Descarga y merge")
-        final_path_str = download_youtube_video(url)
-        st.end()
-
+        hr("Descarga de Video")
+        url = console.input("[bold green]Introduce la URL del video de YouTube:[/bold green] ").strip()
+        
+        with console.status("[bold yellow]Descargando y fusionando video...[/bold yellow]", spinner="dots"):
+            final_path_str = download_youtube_video(url)
+        
         if not final_path_str or not Path(final_path_str).exists():
-            logging.error("Unable to Download the video")
+            logger.error("[bold red]No se pudo descargar el video.[/bold red]")
             return
 
         final_mp4 = Path(final_path_str)
         wdir, odir = make_project_dirs(final_mp4)
-        logging.info(f"Work dir: {wdir}")
-        logging.info(f"Out  dir: {odir}")
+        console.print(f"✅ Video descargado en: [green]{final_mp4}[/green]")
+        logger.info(f"Directorio de trabajo: [cyan]{wdir}[/cyan]")
+        logger.info(f"Directorio de salida: [cyan]{odir}[/cyan]")
 
-        hr("Audio → WAV 16k")
-        st = StepTimer("Extracción de audio")
-        companion_audio = guess_companion_audio(final_mp4)
-        audio_src = companion_audio if companion_audio else final_mp4
-        wav_path = wdir / "audio.wav"
-        extract_audio_wav(src=str(audio_src), wav=str(wav_path))
-        st.end()
+        hr("Extracción de Audio")
+        with console.status("[bold yellow]Extrayendo audio a WAV...[/bold yellow]", spinner="dots"):
+            companion_audio = guess_companion_audio(final_mp4)
+            audio_src = companion_audio if companion_audio else final_mp4
+            wav_path = wdir / "audio.wav"
+            extract_audio_wav(src=str(audio_src), wav=str(wav_path))
+        
         if not wav_path.exists():
-            logging.error("No audio file found for ASR")
+            logger.error("[bold red]No se encontró el archivo de audio para la transcripción.[/bold red]")
             return
-        logging.info(f"Audio for ASR: {wav_path}")
+        console.print(f"✅ Audio extraído a: [green]{wav_path}[/green]")
 
         hr("Transcripción (ASR) con Word Timestamps")
-        st = StepTimer("Transcripción")
         speech_json_path = wdir / "speech.json"
-
-        # TranscribeAudio ahora devuelve una lista de dicts con word-level timestamps
-        transcriptions = transcribeAudio(
-            str(wav_path),
-            model_size="medium",
-            language="es",
-            beam_size=1,
-            vad_filter=True,
-            diarization="auto",
-            write_speech_json_to=str(speech_json_path),
-        )
-        st.end()
-        if not transcriptions:
-            logging.error("Transcription returned empty result")
-            return
+        with console.status("[bold yellow]Transcribiendo audio (esto puede tardar)...[/bold yellow]", spinner="dots"):
+            transcriptions = transcribeAudio(
+                str(wav_path),
+                model_size="medium",
+                language="es",
+                beam_size=1,
+                vad_filter=True,
+                diarization="auto",
+                write_speech_json_to=str(speech_json_path),
+            )
         
-        # El JSON ya se guarda dentro de transcribeAudio, no es necesario hacerlo aquí.
-
-        hr("Selección de highlight (LLM)")
-        trans_text = build_transcript_string(transcriptions)
-        start_sec, end_sec = GetHighlight(trans_text)
-        if not (isinstance(start_sec, (int, float)) and isinstance(end_sec, (int, float)) and end_sec > start_sec):
-            logging.error(f"Invalid highlight window: start={start_sec}, end={end_sec}")
+        if not transcriptions:
+            logger.error("[bold red]La transcripción no devolvió resultados.[/bold red]")
             return
-        print(f"🎯 Highlight: {start_sec:.2f}s → {end_sec:.2f}s")
+        console.print(f"✅ Transcripción completada y guardada en: [green]{speech_json_path}[/green]")
 
-        hr("Recorte (Trim)")
-        st = StepTimer("Recorte")
+        hr("Selección de Highlight (LLM)")
+        with console.status("[bold yellow]Seleccionando el highlight con IA...[/bold yellow]", spinner="dots"):
+            trans_text = build_transcript_string(transcriptions)
+            start_sec, end_sec = GetHighlight(trans_text)
+        
+        if not (isinstance(start_sec, (int, float)) and isinstance(end_sec, (int, float)) and end_sec > start_sec):
+            logger.error(f"[bold red]Ventana de highlight inválida: start={start_sec}, end={end_sec}[/bold red]")
+            return
+        console.print(f"🎯 Highlight seleccionado: [green]{start_sec:.2f}s → {end_sec:.2f}s[/green]")
+
+        hr("Recorte Preciso del Video")
         cut_path = wdir / "cut.mp4"
-        # Forzar siempre el re-encode para asegurar cortes precisos y evitar desincronización de subtítulos.
-        # El método de copia de stream (-c copy) puede ser impreciso si el tiempo de inicio no es un keyframe.
-        trim_video_ffmpeg(
-            src=str(final_mp4),
-            dst=str(cut_path),
-            start=float(start_sec),
-            end=float(end_sec),
-            copy=False  # <-- Forzar re-encode
-        )
-        logging.info("Temporal cut exported with re-encode for frame accuracy.")
-        st.end()
+        with console.status("[bold yellow]Recortando el video (re-codificando para precisión)...[/bold yellow]", spinner="dots"):
+            trim_video_ffmpeg(
+                src=str(final_mp4),
+                dst=str(cut_path),
+                start=float(start_sec),
+                end=float(end_sec),
+                copy=False
+            )
+        console.print(f"✅ Video recortado en: [green]{cut_path}[/green]")
 
-        hr("Crop 9:16 + seguimiento")
-        st = StepTimer("Crop")
+        hr("Cámara Virtual (Crop 9:16 + Seguimiento)")
         cropped_path = wdir / "cropped.mp4"
-        crop_follow_face_1080x1920_yolo(
-            input_path=str(cut_path),
-            output_path=str(cropped_path),
-            speech_json=str(speech_json_path),
-            static_per_speaker=True
-        )
-        st.end()
-        logging.info(f"Cropped clip: {cropped_path}")
+        with console.status("[bold yellow]Aplicando cámara virtual y recorte 9:16...[/bold yellow]", spinner="dots"):
+            crop_follow_face_1080x1920_yolo(
+                input_path=str(cut_path),
+                output_path=str(cropped_path),
+                speech_json=str(speech_json_path),
+                static_per_speaker=True
+            )
+        console.print(f"✅ Clip recortado con cámara virtual: [green]{cropped_path}[/green]")
 
-        hr("Mux final (NVENC)")
-        st = StepTimer("Mux")
+        hr("Muxing Final (NVENC)")
         final_short = odir / "Final.mp4"
-        mux_audio_video_nvenc(
-            video_with_audio=str(cut_path),
-            video_without_audio=str(cropped_path),
-            dst=str(final_short),
-            fps=30,
-            v_bitrate="6M"
-        )
-        st.end()
-        print(f"✅ Short (sin subtítulos) listo en: {final_short}")
+        with console.status("[bold yellow]Fusionando video y audio...[/bold yellow]", spinner="dots"):
+            mux_audio_video_nvenc(
+                video_with_audio=str(cut_path),
+                video_without_audio=str(cropped_path),
+                dst=str(final_short),
+                fps=30,
+                v_bitrate="6M"
+            )
+        console.print(f"✅ Short (sin subtítulos) listo en: [green]{final_short}[/green]")
 
         hr("Generación de Subtítulos Dinámicos")
-        st = StepTimer("Generación de ASS y Burn-in")
-
-        # Filtrar los segmentos de la transcripción que caen en el highlight
-        highlight_segments = []
-        for segment in transcriptions:
-            seg_start = segment.get('start', 0)
-            seg_end = segment.get('end', 0)
-            if max(seg_start, start_sec) < min(seg_end, end_sec):
-                # Ajustar timestamps de los segmentos y sus palabras al inicio del clip
-                new_seg = segment.copy()
-                new_seg['start'] = seg_start - start_sec
-                new_seg['end'] = seg_end - start_sec
-                
-                new_words = []
-                if 'words' in new_seg and new_seg['words'] is not None:
-                    for word_info in new_seg['words']:
-                        new_word_info = word_info.copy()
-                        new_word_info['start'] = word_info['start'] - start_sec
-                        new_word_info['end'] = word_info['end'] - start_sec
-                        new_words.append(new_word_info)
-                new_seg['words'] = new_words
-                highlight_segments.append(new_seg)
-
         ass_path = odir / "subtitles.ass"
-        generate_ass(highlight_segments, ass_path)
-
         final_subtitled_short = odir / f"{final_short.stem}_subtitled.mp4"
-        burn_in_subtitles(
-            video_path=final_short,
-            subtitle_path=ass_path,
-            output_path=final_subtitled_short
-        )
-        st.end()
+        
+        with console.status("[bold yellow]Generando subtítulos ASS y quemándolos en el video...[/bold yellow]", spinner="dots"):
+            # Filtrar los segmentos de la transcripción que caen en el highlight
+            highlight_segments = []
+            for segment in transcriptions:
+                seg_start = segment.get('start', 0)
+                seg_end = segment.get('end', 0)
+                if max(seg_start, start_sec) < min(seg_end, end_sec):
+                    new_seg = segment.copy()
+                    new_seg['start'] = seg_start - start_sec
+                    new_seg['end'] = seg_end - start_sec
+                    
+                    new_words = []
+                    if 'words' in new_seg and new_seg['words'] is not None:
+                        for word_info in new_seg['words']:
+                            new_word_info = word_info.copy()
+                            new_word_info['start'] = word_info['start'] - start_sec
+                            new_word_info['end'] = word_info['end'] - start_sec
+                            new_words.append(new_word_info)
+                    new_seg['words'] = new_words
+                    highlight_segments.append(new_seg)
 
-        print(f"\n✅ Done! Short final con subtítulos dinámicos en: {final_subtitled_short}\n")
+            generate_ass(highlight_segments, ass_path)
+            burn_in_subtitles(
+                video_path=final_short,
+                subtitle_path=ass_path,
+                output_path=final_subtitled_short
+            )
+        console.print(f"✅ Short final con subtítulos dinámicos en: [green]{final_subtitled_short}[/green]")
 
     except KeyboardInterrupt:
-
-        print("\nInterrupted by user.")
+        console.print("\n[bold yellow]Proceso interrumpido por el usuario.[/bold yellow]")
     except Exception as e:
-        logging.exception(f"Fatal error: {e}")
+        logger.exception("[bold red]¡Ha ocurrido un error fatal![/bold red]")
+        console.print(f"[bold red]Error: {e}[/bold red]")
 
 if __name__ == "__main__":
     main()

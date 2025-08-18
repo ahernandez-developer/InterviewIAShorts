@@ -40,7 +40,7 @@ def run_ffmpeg_with_progress(cmd: list[str], total_duration: float | None, label
     proc = subprocess.Popen(
         full,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE, # Changed to PIPE
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -88,7 +88,9 @@ def run_ffmpeg_with_progress(cmd: list[str], total_duration: float | None, label
 
     finally:
         ret = proc.wait()
-        sys.stdout.write("\n")
+        sys.stdout.write("\n") # Ensure newline after progress bar
         sys.stdout.flush()
         if ret != 0:
-            raise RuntimeError(f"FFmpeg error ({ret}). Última línea: {last_line}")
+            # Read stderr for error details
+            stderr_output = proc.stderr.read()
+            raise RuntimeError(f"FFmpeg error ({ret}). Última línea: {last_line}. Stderr: {stderr_output}")
