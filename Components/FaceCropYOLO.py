@@ -1,10 +1,19 @@
 # Components/FaceCropYOLO.py
 from __future__ import annotations
-import os, json, time, shutil
+
+import os
+import time
+import shutil
 from pathlib import Path
 from collections import deque
+from typing import List, Tuple, Optional
+
 import numpy as np
 import cv2
+
+# ============================
+#     PARÁMETROS GLOBALES
+# ============================
 
 # Salida vertical 9:16
 OUT_W, OUT_H = 1080, 1920
@@ -12,27 +21,29 @@ OUT_W, OUT_H = 1080, 1920
 # Detección
 DET_SIZE = 640
 CONF_THR = 0.35
-FACE_SCALE_BOX = 1.32     # expandimos bbox para no cortar frente/mentón
+FACE_SCALE_BOX = 1.35  # expandir bbox para no cortar frente/mentón
 
-# Estabilización (paneo horizontal)
-DEADZONE_PX = 12
-MAX_STEP_PX = 18
-SPRING_K    = 0.10
-DAMPING     = 0.88
-TARGET_MEDIAN_WIN = 5
-CUT_JUMP_THRESH   = 240
-CUT_RAMP_FRAMES   = 10
-MISS_HYSTERESIS   = 8
-EDGE_MARGIN       = 26
+# Estabilización de paneo (modo dinámico)
+DEADZONE_PX = 14          # zona muerta alrededor del objetivo (px)
+MAX_STEP_PX = 22          # avance máximo del centro por frame
+SPRING_K     = 0.12       # ganancia del “muelle”
+DAMPING      = 0.85       # amortiguación de la velocidad
+TARGET_MEDIAN_WIN = 5     # mediana temporal del centro objetivo
+CUT_JUMP_THRESH  = 260    # si el objetivo salta mucho, rampa
+CUT_RAMP_FRAMES  = 10
+MISS_HYSTERESIS  = 7      # frames tolerados sin detección
+EDGE_MARGIN      = 24     # margen para no pegar al borde
 
-# “Cámara estática” (zoom fijo o casi fijo)
-STATIC_ZOOM_WIN_W = OUT_W           # ancho deseado de la ventana de recorte
-STATIC_ZOOM_ALPHA = 0.08            # si quieres micro-ajustes lentos; 0 = fijo
+# Zoom dinámico (modo dinámico)
+FACE_TARGET_RATIO = 0.33  # cara ≈ 33% del ancho de la ventana
+ZOOM_ALPHA        = 0.12  # suavizado EMA del ancho de ventana
+ZOOM_MAX_STEP     = 32    # cambio máx. por frame (px)
+ZOOM_MIN_WIN      = int(OUT_W * 0.85)  # zoom-in máximo
+ZOOM_MAX_WIN_MULT = 1.70  # zoom-out máximo relativo a OUT_W
 
-# Lógica de cambio guiado por voz
-SPEECH_DWELL_SEC       = 0.6        # mínimo hablando para aceptar cambio
-SILENCE_SWITCH_WINDOW  = 0.35       # idealmente cambiamos en esta pausa (s)
-FACE_MARGIN_IN_CROP_PX = 32         # margen mínimo de cara al borde del crop
+# ============================
+#       HELPERS BÁSICOS
+# ============================
 
 def _ensure_parent(p: str | Path):
     Path(p).parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +73,10 @@ def _resize_to_h(frame, target_h=OUT_H):
     new_w = int(round(w * s))
     return cv2.resize(frame, (new_w, target_h), interpolation=cv2.INTER_LINEAR), new_w, target_h, s
 
-# ---------- Detectores ----------
+# ============================
+#         DETECTORES
+# ============================
+
 class _YoloFaceDetector:
     def __init__(self, weights_path: str):
         from ultralytics import YOLO
@@ -70,7 +84,7 @@ class _YoloFaceDetector:
         self.device = 0 if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
         self.half = self.device != "cpu"
 
-    def detect_many(self, frame_bgr):
+    def detect(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
         scale = DET_SIZE / max(h, w)
         nh, nw = int(round(h * scale)), int(round(w * scale))
@@ -84,26 +98,25 @@ class _YoloFaceDetector:
             source=canvas, imgsz=DET_SIZE, conf=CONF_THR,
             verbose=False, device=self.device, half=self.half
         )[0]
-        out = []
         if res.boxes is None or len(res.boxes) == 0:
-            return out
+            return None
         boxes = res.boxes.xyxy.cpu().numpy()
         confs = res.boxes.conf.cpu().numpy()
-        for (x1,y1,x2,y2), c in zip(boxes, confs):
-            # deshacer padding + escala
-            x1 = (x1 - pad_left) / scale; x2 = (x2 - pad_left) / scale
-            y1 = (y1 - pad_top) / scale;  y2 = (y2 - pad_top) / scale
-            x1 = max(0, min(w-1, x1)); x2 = max(0, min(w-1, x2))
-            y1 = max(0, min(h-1, y1)); y2 = max(0, min(h-1, y2))
-            out.append((int(x1), int(y1), int(x2 - x1), int(y2 - y1), float(c)))
-        return out
+        idx = int(np.argmax(confs))
+        x1, y1, x2, y2 = boxes[idx]
+        # deshacer padding + escala
+        x1 = (x1 - pad_left) / scale; x2 = (x2 - pad_left) / scale
+        y1 = (y1 - pad_top) / scale;  y2 = (y2 - pad_top) / scale
+        x1 = max(0, min(w-1, x1)); x2 = max(0, min(w-1, x2))
+        y1 = max(0, min(h-1, y1)); y2 = max(0, min(h-1, y2))
+        return (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
 
 class _Res10DnnDetector:
     def __init__(self, prototxt: str, caffemodel: str, conf_thr: float = 0.5):
         self.net = cv2.dnn.readNetFromCaffe(prototxt, caffemodel)
         self.conf_thr = conf_thr
 
-    def detect_many(self, frame_bgr):
+    def detect(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
         blob = cv2.dnn.blobFromImage(
             cv2.resize(frame_bgr, (300, 300)), 1.0, (300, 300),
@@ -111,15 +124,18 @@ class _Res10DnnDetector:
         )
         self.net.setInput(blob)
         detections = self.net.forward()
-        out = []
+        if detections.shape[2] == 0:
+            return None
+        best, best_score = None, -1.0
         for i in range(detections.shape[2]):
             score = float(detections[0, 0, i, 2])
             if score < self.conf_thr:
                 continue
             x1, y1, x2, y2 = (detections[0, 0, i, 3:7] * np.array([w, h, w, h])).astype(int)
             x1 = max(0,x1); y1 = max(0,y1); x2 = min(w-1,x2); y2 = min(h-1,y2)
-            out.append((x1, y1, x2-x1, y2-y1, score))
-        return out
+            if score > best_score:
+                best_score, best = score, (x1, y1, x2-x1, y2-y1)
+        return best
 
 def _pick_detector():
     weights = os.getenv("FACE_MODEL_PATH", "models/yolov8n-face.pt")
@@ -133,13 +149,18 @@ def _pick_detector():
     cafe  = Path("res10_300x300_ssd_iter_140000_fp16.caffemodel")
     if not proto.exists() or not cafe.exists():
         raise FileNotFoundError(
-            "No se encontró YOLO (.pt) ni DNN Res10 (deploy.prototxt / res10_*.caffemodel)."
+            "No se encontró YOLO (.pt) ni los archivos de DNN Res10. Provee FACE_MODEL_PATH "
+            "o coloca deploy.prototxt y res10_...caffemodel en el root."
         )
     print(f"[Face] Using DNN Res10: {proto.name}, {cafe.name}")
     return _Res10DnnDetector(str(proto), str(cafe))
 
-# ---------- Estabilizador ----------
+# ============================
+#     ESTABILIZADORES (dinámico)
+# ============================
+
 class CinematicStabilizer:
+    """ Paneo horizontal suave con mediana temporal + spring-damper + deadband + ramp. """
     def __init__(self, width: int):
         self.W = width
         self.cx_smoothed = width / 2.0
@@ -167,7 +188,7 @@ class CinematicStabilizer:
 
         if self.ramp_frames_left > 0:
             t = 1.0 - (self.ramp_frames_left / float(CUT_RAMP_FRAMES))
-            t2 = 3*t*t - 2*t*t*t
+            t2 = 3*t*t - 2*t*t*t  # ease-in-out cúbica
             cx_goal = (1.0 - t2) * self.ramp_start + t2 * self.ramp_end
             self.ramp_frames_left -= 1
         else:
@@ -188,69 +209,116 @@ class CinematicStabilizer:
         self.cx_smoothed = max(min_cx, min(max_cx, self.cx_smoothed))
         return self.cx_smoothed
 
-# ---------- VAD / Speech gating ----------
-class SpeechGate:
-    """Gestiona 'hay voz' y ventanas ideales para cambiar de sujeto."""
-    def __init__(self, fps: float, speech_json: str | None = None):
-        self.fps = fps
-        self.t = 0.0
-        self.idx = 0
-        self.speech = []  # lista de (start,end)
-        if speech_json and Path(speech_json).exists():
-            try:
-                data = json.loads(Path(speech_json).read_text(encoding="utf-8"))
-                for seg in data:
-                    self.speech.append((float(seg["start"]), float(seg["end"])))
-            except Exception:
-                pass
-        self.in_speech_prev = False
-        self.t_started = None
+class ZoomManager:
+    """ Mantiene el ancho de la ventana (win_w) según tamaño de cara y seguridad en bordes. """
+    def __init__(self, frame_width: int):
+        self.W = frame_width
+        self.win_w = OUT_W
 
-    def _simple_vad(self, mono16: np.ndarray | None):
-        # Placeholder: retornamos estado previo si no hay VAD externo.
-        # Como llamamos por frame, usaremos las ventanas de self.speech si existen.
-        return None
+    def update(self, face_box, cx_crop: float):
+        W = self.W
+        min_win = max(ZOOM_MIN_WIN, OUT_W)
+        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
 
-    def step(self):
-        """Avanza 1 frame en el timeline, retorna: in_speech, can_switch_now"""
-        t = self.t
-        in_speech = False
-        if self.speech:
-            # ¿t está dentro de alguno?
-            for s, e in self.speech:
-                if s <= t <= e:
-                    in_speech = True
-                    break
-
-        # control de dwell y “switch en silencio”
-        can_switch = False
-        if in_speech:
-            # acumulamos dwell
-            if not self.in_speech_prev:
-                self.t_started = t
-            elif self.t_started is not None and (t - self.t_started) >= SPEECH_DWELL_SEC:
-                # ya cumplimos dwell, pero intentaremos cambiar al entrar a silencio
-                can_switch = False
+        if face_box is not None:
+            x, y, w, h = face_box
+            target_by_face = int(round(max(w / max(FACE_TARGET_RATIO, 1e-4), min_win)))
         else:
-            # silencio: si veníamos de voz y teníamos dwell suficiente, permitir switch
-            if self.in_speech_prev and self.t_started is not None:
-                if (t - self.t_started) >= SPEECH_DWELL_SEC:
-                    can_switch = True
-                self.t_started = None
+            target_by_face = int(round(min(OUT_W * 1.10, max_win)))
 
-        self.in_speech_prev = in_speech
-        self.t += 1.0 / max(self.fps, 1e-6)
-        return in_speech, can_switch
+        protect = self.win_w
+        if face_box is not None:
+            x, y, w, h = face_box
+            face_cx = x + w/2.0
+            half = self.win_w / 2.0
+            left_edge  = cx_crop - half
+            right_edge = cx_crop + half
+            left_dist  = face_cx - left_edge
+            right_dist = right_edge - face_cx
+            edge_thresh = 0.20 * self.win_w
+            if left_dist < edge_thresh or right_dist < edge_thresh:
+                protect = int(round(min(self.win_w * 1.08, max_win)))
 
-# ---------- Pipeline principal ----------
+        target = int(round(np.clip(min(target_by_face, protect), min_win, max_win)))
+
+        new_win = int(round(ZOOM_ALPHA * target + (1 - ZOOM_ALPHA) * self.win_w))
+        if abs(new_win - self.win_w) > ZOOM_MAX_STEP:
+            new_win = self.win_w + np.sign(new_win - self.win_w) * ZOOM_MAX_STEP
+
+        self.win_w = int(round(np.clip(new_win, min_win, max_win)))
+        return self.win_w
+
+# ============================
+#   CARGA DE TURNOS (speech.json)
+# ============================
+
+def _load_turns(speech_json: str | Path, fps: float) -> List[Tuple[float, float, str]]:
+    """
+    Lee speech.json (lista de items con speaker,start,end,text) y devuelve
+    una lista de turnos compactados [(start,end,speaker)] fusionando segmentos
+    contiguos del mismo hablante y descartando silencios muy cortos.
+    """
+    import json
+    p = Path(speech_json)
+    if not p.exists():
+        return []
+
+    with open(p, "r", encoding="utf-8") as f:
+        items = json.load(f)
+
+    # Ordenar por tiempo y compactar
+    items.sort(key=lambda d: float(d.get("start", 0.0)))
+    turns: List[Tuple[float, float, str]] = []
+    cur_spk = None
+    cur_s = None
+    cur_e = None
+
+    def _push():
+        if cur_spk is None or cur_s is None or cur_e is None:
+            return
+        dur = cur_e - cur_s
+        if dur >= 0.8:  # ignora micro-picos
+            turns.append((float(cur_s), float(cur_e), str(cur_spk)))
+
+    for it in items:
+        spk = str(it.get("speaker", "SPEAKER_0"))
+        s   = float(it.get("start", 0.0))
+        e   = float(it.get("end", s))
+        if cur_spk is None:
+            cur_spk, cur_s, cur_e = spk, s, e
+            continue
+        if spk == cur_spk and s <= (cur_e + 0.25):  # fusiona si solapa o gap corto
+            cur_e = max(cur_e, e)
+        else:
+            _push()
+            cur_spk, cur_s, cur_e = spk, s, e
+    _push()
+    return turns
+
+def _find_turn_index(turns: List[Tuple[float,float,str]], tsec: float) -> int:
+    """Devuelve el índice del turno activo en tsec (o -1 si no hay)."""
+    lo, hi = 0, len(turns)-1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        s, e, _ = turns[mid]
+        if tsec < s: hi = mid - 1
+        elif tsec > e: lo = mid + 1
+        else: return mid
+    return -1
+
+# ============================
+#      PIPELINE PRINCIPAL
+# ============================
+
 def crop_follow_face_1080x1920_yolo(
     input_path: str,
     output_path: str,
-    speech_json: str | None = None,   # opcional: segmentos de voz [{"start":s,"end":e},...]
+    speech_json: Optional[str] = None,
+    static_per_speaker: bool = False,
 ):
     """
-    Detección por frame (YOLO o DNN) + estabilización + 'cámara estática' (zoom fijo)
-    con gating por voz: solo cambiamos de objetivo en pausas y tras un mínimo hablando.
+    - Si static_per_speaker=True y speech_json existe: fija una ventana por turno de hablante.
+    - Si no: usa modo dinámico estabilizado (paneo+zoom).
     """
     _ensure_parent(output_path)
     cap = cv2.VideoCapture(input_path)
@@ -260,42 +328,25 @@ def crop_follow_face_1080x1920_yolo(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     writer = _open_writer_with_fallback(output_path, fps)
 
+    # Turnos
+    turns = _load_turns(speech_json, fps) if static_per_speaker and speech_json else []
+    use_static = static_per_speaker and len(turns) > 0
+
     detector = _pick_detector()
+
     frame_idx = 0
-    t0 = time.time()
-
     last_face = None
+
+    # Estado del modo dinámico (fallback)
     stabilizer = None
+    zoomer     = None
 
-    # estado de objetivo (persona/cara elegida)
-    target_face = None        # (x,y,w,h) en espacio reescalado
-    frames_on_target = 0
+    # Estado del modo estático por turno
+    current_turn = -1
+    anchor_cx: Optional[float] = None  # centro fijo por turno
+    anchor_win_w: Optional[int] = None # ancho fijo por turno
 
-    # ventana de recorte (zoom estático con micro-ajuste)
-    win_w = STATIC_ZOOM_WIN_W
-
-    gate = SpeechGate(fps=fps, speech_json=speech_json)
-
-    def _choose_face(faces_rs, current):
-        """Selecciona cara según (1) IOU con actual, (2) tamaño, (3) centrado."""
-        if not faces_rs:
-            return None
-        if current is None:
-            # la más grande
-            return max(faces_rs, key=lambda b: b[2]*b[3])[:4]
-        # mejor IOU con la actual, luego tamaño
-        cx, cy, cw, ch = current
-        best, best_key = None, (-1.0, -1.0)
-        for (x,y,w,h,_) in faces_rs:
-            inter_x1 = max(x, cx); inter_y1 = max(y, cy)
-            inter_x2 = min(x+w, cx+cw); inter_y2 = min(y+h, cy+ch)
-            inter = max(0, inter_x2-inter_x1) * max(0, inter_y2-inter_y1)
-            iou = inter / max(1.0, (w*h + cw*ch - inter))
-            size = w*h
-            key = (iou, size)
-            if key > best_key:
-                best_key, best = key, (x,y,w,h)
-        return best
+    t0 = time.time()
 
     while True:
         ok, frame = cap.read()
@@ -307,98 +358,106 @@ def crop_follow_face_1080x1920_yolo(
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
+        # trabajamos a altura fija
         frs, W, H, scale = _resize_to_h(frame)
-        if stabilizer is None:
-            stabilizer = CinematicStabilizer(W)
 
-        # detección (todas las caras)
-        faces = detector.detect_many(frame)  # en espacio original
-        faces_rs = []
-        for (x,y,w,h,c) in faces:
-            x = int(round(x*scale)); y = int(round(y*scale))
-            w = int(round(w*scale)); h = int(round(h*scale))
-            x,y,w,h = _expand_bbox(x,y,w,h, FACE_SCALE_BOX, W, H)
-            faces_rs.append((x,y,w,h,c))
+        # --- detección cara en coords del frame original ---
+        face = detector.detect(frame)
+        detected = face is not None
+        if detected:
+            x, y, w, h = face
+            # llevar a espacio redimensionado
+            x = int(round(x * scale)); y = int(round(y * scale))
+            w = int(round(w * scale)); h = int(round(h * scale))
+            x, y, w, h = _expand_bbox(x, y, w, h, FACE_SCALE_BOX, W, H)
+            last_face = (x, y, w, h)
 
-        in_speech, can_switch = gate.step()
+        # tiempo actual
+        tsec = frame_idx / float(fps)
 
-        # elegir/retener objetivo
-        if target_face is None:
-            target_face = _choose_face(faces_rs, None)
-            frames_on_target = 0
+        if use_static:
+            # ¿cambió el turno?
+            idx = _find_turn_index(turns, tsec)
+            if idx != current_turn:
+                current_turn = idx
+                anchor_cx, anchor_win_w = None, None
+                if current_turn >= 0:
+                    # si hay cara, toma el centro y fija ventana;
+                    # si no hay, usa centro y OUT_W*1.2 para contexto
+                    if last_face is not None:
+                        fx, fy, fw, fh = last_face
+                        anchor_cx = fx + fw/2.0
+                        # queremos una ventana donde la cara ocupe ~FACE_TARGET_RATIO
+                        target_w = int(round(max(fw / max(FACE_TARGET_RATIO, 1e-4), OUT_W)))
+                        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
+                        anchor_win_w = int(np.clip(target_w, OUT_W, max_win))
+                    else:
+                        anchor_cx = W / 2.0
+                        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
+                        anchor_win_w = int(np.clip(int(OUT_W * 1.15), OUT_W, max_win))
+                else:
+                    # fuera de turnos: vista centro con algo de contexto
+                    anchor_cx = W / 2.0
+                    max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
+                    anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
+
+            # aplicar recorte estático
+            cx = float(anchor_cx if anchor_cx is not None else (W/2.0))
+            win_w = int(anchor_win_w if anchor_win_w is not None else OUT_W)
+            half = win_w / 2.0
+            left = int(round(cx - half))
+            left = max(0, min(W - win_w, left))
+            win = frs[:, left:left+win_w]
+            crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+            crop = np.ascontiguousarray(crop, dtype=np.uint8)
+            writer.write(crop)
+
         else:
-            # ¿sigue visible la cara objetivo?
-            still = None
-            for (x,y,w,h,_) in faces_rs:
-                # IOU con objetivo actual
-                ox,oy,ow,oh = target_face
-                inter_x1 = max(x, ox); inter_y1 = max(y, oy)
-                inter_x2 = min(x+w, ox+ow); inter_y2 = min(y+h, oy+oh)
-                inter = max(0, inter_x2-inter_x1) * max(0, inter_y2-inter_y1)
-                iou = inter / max(1.0, (w*h + ow*oh - inter))
-                if iou > 0.25:
-                    still = (x,y,w,h)
-                    break
+            # --- modo dinámico estabilizado (comportamiento anterior) ---
+            if stabilizer is None:
+                stabilizer = CinematicStabilizer(W)
+            if zoomer is None:
+                zoomer = ZoomManager(W)
 
-            if still is not None:
-                target_face = still
-                frames_on_target += 1
+            if last_face is not None:
+                x, y, w, h = last_face
+                cx_target = x + w/2.0
+                face_for_zoom = last_face
             else:
-                # la cara se perdió. ¿Podemos cambiar ahora?
-                if can_switch:
-                    cand = _choose_face(faces_rs, target_face)
-                    if cand is not None:
-                        target_face = cand
-                        frames_on_target = 0
-                # si no podemos cambiar, mantenemos el último encuadre (no recentrar).
+                if stabilizer.miss_count < MISS_HYSTERESIS:
+                    # mantén el último centro por unos frames
+                    cx_target = stabilizer.cx_smoothed
+                    face_for_zoom = None if last_face is None else last_face
+                else:
+                    cx_target = W / 2.0
+                    face_for_zoom = None
 
-        # si no hay ninguna cara ahora mismo, solo mantenemos paneo previo
-        face_for_frame = target_face
+            cx = stabilizer.update_target(cx_target, detected)
+            win_w = zoomer.update(face_for_zoom, cx)
+            half  = win_w / 2.0
+            left = int(round(cx - half))
+            left = max(0, min(W - win_w, left))
+            win = frs[:, left:left+win_w]
+            crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+            crop = np.ascontiguousarray(crop, dtype=np.uint8)
+            writer.write(crop)
 
-        # paneo suavizado
-        if face_for_frame is not None:
-            x,y,w,h = face_for_frame
-            cx_target = x + w/2.0
-            stabilizer.update_target(cx_target, detected=True)
-        else:
-            stabilizer.update_target(W/2.0, detected=False)
-
-        cx = stabilizer.cx_smoothed
-
-        # ======= cámara “estática”: win_w casi fijo + garantía de cara completa =======
-        # micro-ajuste lento hacia STATIC_ZOOM_WIN_W (si lo quieres 100% fijo, usa alpha=0)
-        win_w = int(round(STATIC_ZOOM_ALPHA * STATIC_ZOOM_WIN_W + (1-STATIC_ZOOM_ALPHA) * win_w))
-        win_w = max(OUT_W, min(W, win_w))
-        half = win_w / 2.0
-        left = int(round(cx - half))
-
-        # Garantizar que la cara quede dentro del crop con margen
-        if face_for_frame is not None:
-            fx,fy,fw,fh = face_for_frame
-            face_cx = fx + fw/2
-            # corremos la ventana si la cara queda cerca del borde
-            if face_cx - left < FACE_MARGIN_IN_CROP_PX:
-                left = int(face_cx - FACE_MARGIN_IN_CROP_PX)
-            if (left + win_w) - face_cx < FACE_MARGIN_IN_CROP_PX:
-                left = int(face_cx + FACE_MARGIN_IN_CROP_PX - win_w)
-
-        # límites
-        left = max(0, min(W - win_w, left))
-        win = frs[:, left:left+win_w]
-
-        crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
-        crop = np.ascontiguousarray(crop, dtype=np.uint8)
-        writer.write(crop)
-
+        # log de rendimiento
         if frame_idx % 60 == 0:
             elapsed = round(time.time() - t0, 2)
-            print(f"[FaceCrop] f={frame_idx} | {frame_idx/max(elapsed,1e-6):.1f} FPS | W={W} | win_w={win_w} | speech={in_speech} can_switch={can_switch}")
+            mode = "static" if use_static else "dynamic"
+            print(f"[FaceCrop:{mode}] f={frame_idx} | {frame_idx/max(elapsed,1e-6):.1f} FPS | W={W}")
 
     writer.release()
     cap.release()
     print("[FaceCrop] listo.")
 
-def mux_audio_video_nvenc(video_with_audio: str, video_without_audio: str, dst: str, fps: int = 30, v_bitrate: str = "6M"):
+# ============================
+#      MUX (NVENC)
+# ============================
+
+def mux_audio_video_nvenc(video_with_audio: str, video_without_audio: str, dst: str,
+                          fps: int = 30, v_bitrate: str = "6M"):
     ff = shutil.which("ffmpeg.exe" if str(Path(os.sys.executable)).lower().startswith("c:") else "ffmpeg")
     if not ff:
         raise RuntimeError("FFmpeg no encontrado")

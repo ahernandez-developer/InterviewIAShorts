@@ -11,7 +11,7 @@ from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
 from Components.LanguageTasks import GetHighlight
 # En lugar del FaceCrop “clásico”, usa el YOLO/DNN:
-from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo as crop_follow_face_1080x1920
+from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo
 from Components.FaceCropYOLO import mux_audio_video_nvenc
 
 load_dotenv()
@@ -146,7 +146,7 @@ def main():
         hr("Crop 9:16 + seguimiento")
         st = StepTimer("Crop")
         cropped_path = wdir / "cropped.mp4"
-        crop_follow_face_1080x1920(
+        crop_follow_face_1080x1920_yolo(
         input_path=str(cut_path),
         output_path=str(cropped_path),
         speech_json=str(speech_json_path),   # 🔹 PASO NUEVO
