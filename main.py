@@ -5,7 +5,7 @@ import logging
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-
+import json
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
@@ -13,7 +13,6 @@ from Components.LanguageTasks import GetHighlight
 # En lugar del FaceCrop “clásico”, usa el YOLO/DNN:
 from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo as crop_follow_face_1080x1920
 from Components.FaceCropYOLO import mux_audio_video_nvenc
-
 
 load_dotenv()
 logging.basicConfig(
@@ -89,11 +88,26 @@ def main():
 
         hr("Transcripción (ASR)")
         st = StepTimer("Transcripción")
-        transcriptions = transcribeAudio(str(wav_path))
+        transcriptions = transcribeAudio(
+        str(wav_path),
+        model_size="medium",          # o el que prefieras
+        language="es",
+        beam_size=1,
+        vad_filter=True,
+        diarization="auto",           # "auto" intenta pyannote si está disponible
+        write_speech_json_to=str(wdir / "speech.json"),
+        )
         st.end()
         if not transcriptions:
             logging.error("Transcription returned empty result")
             return
+
+        speech_json_path = wdir / "speech.json"
+        with open(speech_json_path, "w", encoding="utf-8") as f:
+            json.dump([
+                {"text": text, "start": start, "end": end}
+                for text, start, end in transcriptions
+            ], f, ensure_ascii=False, indent=2)
 
         hr("Selección de highlight (LLM)")
         trans_text = build_transcript_string(transcriptions)
@@ -131,8 +145,10 @@ def main():
         st = StepTimer("Crop")
         cropped_path = wdir / "cropped.mp4"
         crop_follow_face_1080x1920(
-            input_path=str(cut_path),
-            output_path=str(cropped_path)
+        input_path=str(cut_path),
+        output_path=str(cropped_path),
+        speech_json=str(speech_json_path),   # 🔹 PASO NUEVO
+        static_per_speaker=True              # 🔹 NUEVO FLAG
         )
         st.end()
         logging.info(f"Cropped clip: {cropped_path}")
