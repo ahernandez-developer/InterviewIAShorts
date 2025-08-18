@@ -1,102 +1,169 @@
-# AI Youtube Shorts Generator
+# AI Shorts Generator 🎬🤖
 
-AI Youtube Shorts Generator is a Python tool designed to generate engaging YouTube shorts from long-form videos. By leveraging the power of GPT-4 and Whisper, it extracts the most interesting highlights, detects speakers, and crops the content vertically for shorts. This tool is currently in version 0.1 and might have some bugs.
+> Generador automático de **YouTube Shorts** a partir de videos largos usando Whisper, OpenAI GPT y OpenCV/FFmpeg.  
+Convierte entrevistas o podcasts en clips atractivos en formato vertical listos para subir a TikTok, Reels y Shorts.
 
-If you wish to add shorts generation into your application, here is an api to create shorts from long form videos :- https://docs.vadoo.tv/docs/guide/create-ai-clips
+---
 
-### Youtube tutorial -> https://youtu.be/dKMueTMW1Nw
+## 🚀 Características
 
-### Medium tutorial -> https://medium.com/@anilmatcha/ai-youtube-shorts-generator-in-python-a-complete-tutorial-c3df6523b362
+- 📥 Descarga de videos desde YouTube u otras fuentes (`yt-dlp`).
+- 📝 Transcripción automática con **Whisper** (soporte multi-idioma).
+- ✂️ Selección inteligente de highlights con **GPT-4**.
+- 🧑‍🤝‍🧑 Detección de speakers y segmentación por turnos de voz.
+- 🎥 Recorte automático a formato **9:16 vertical**, centrando en rostros o áreas relevantes.
+- 📂 Genera un **manifest.json** por corrida con metadatos (timestamps, prompts, scores, modelos usados).
+- 🐳 Compatible con Docker para despliegue en cualquier entorno.
 
-![longshorts](https://github.com/user-attachments/assets/3f5d1abf-bf3b-475f-8abf-5e253003453a)
+---
 
-[Demo Input Video](https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator/blob/main/videos/Blinken%20Admires%20'Friend%20Jai'%20As%20Indian%20EAM%20Gets%20Savage%20In%20Munich%3B%20'I'm%20Smart%20Enough...'%20%7C%20Watch.mp4)
+## 📦 Requisitos
 
-[Demo Output Video](https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator/blob/main/Final.mp4)
+- **Python 3.8+**
+- **FFmpeg** instalado y accesible desde la terminal (`ffmpeg -version`)
+- **OpenCV** con soporte de modelos Haar/SSD
+- **Cuenta de OpenAI** y API Key activa
 
-## Features
+---
 
-- **Video Download**: Given a YouTube URL, the tool downloads the video.
-- **Transcription**: Uses Whisper to transcribe the video.
-- **Highlight Extraction**: Utilizes OpenAI's GPT-4 to identify the most engaging parts of the video.
-- **Speaker Detection**: Detects speakers in the video.
-- **Vertical Cropping**: Crops the highlighted sections vertically, making them perfect for shorts.
-
-## Installation
-
-### Prerequisites
-
-- Python 3.7 or higher
-- FFmpeg
-- OpenCV
-
-### Steps
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator.git
-   cd AI-Youtube-Shorts-Generator
-   ```
-
-2. Create a virtual environment
+## ⚙️ Instalación
 
 ```bash
-python3.10 -m venv venv
-```
+# 1. Clonar el repositorio
+git clone https://github.com/ahernandez-developer/InterviewIAShorts.git
+cd InterviewIAShorts
 
-3. Activate a virtual environment:
+# 2. Crear entorno virtual
+python -m venv venv
+source venv/bin/activate   # en Linux/Mac
+venv\Scripts\activate    # en Windows
 
-```bash
-source venv/bin/activate # On Windows: venv\Scripts\activate
-```
-
-4. Install the python dependencies:
-
-```bash
+# 3. Instalar dependencias
 pip install -r requirements.txt
+
+# 4. Configurar variables de entorno
+cp .env.example .env
+# Editar .env y colocar tu API key de OpenAI
 ```
 
 ---
 
-1. Set up the environment variables.
+## 🔑 Configuración
 
-Create a `.env` file in the project root directory and add your OpenAI API key:
+Archivo `.env`:
 
-```bash
-OPENAI_API=your_openai_api_key_here
+```ini
+OPENAI_API_KEY=tu_api_key_aqui
 ```
 
-## Usage
+Ejemplo de `.env.example` ya incluido en el repo.
 
-1. Ensure your `.env` file is correctly set up with your OpenAI API key.
-2. Run the main script and enter the desired YouTube URL when prompted:
-   ```bash
-   python main.py
-   ```
+---
 
-## Contributing
+## ▶️ Uso
 
-Contributions are welcome! Please fork the repository and submit a pull request.
+Ejecutar el pipeline principal desde la raíz del proyecto:
 
-## License
+```bash
+python main.py --url "https://youtube.com/watch?v=XXXX" --max-clips 5 --outdir ./outputs
+```
 
-This project is licensed under the MIT License.
+### Parámetros disponibles
 
-## Disclaimer
+| Parámetro       | Descripción |
+|-----------------|-------------|
+| `--url`         | URL del video de YouTube |
+| `--max-clips`   | Número máximo de clips a generar |
+| `--outdir`      | Carpeta de salida (default: `./outputs`) |
+| `--model-size`  | Tamaño del modelo Whisper (`tiny`, `base`, `small`, `medium`, `large`) |
+| `--language`    | Forzar idioma de transcripción (`es`, `en`, etc.) |
 
-This is a v0.1 release and might have some bugs. Please report any issues on the [GitHub Repository](https://github.com/SamurAIGPT/AI-Youtube-Shorts-Generator).
+---
 
-### Other useful Video AI Projects
+## 📂 Estructura de salida
 
-[AI Influencer generator](https://github.com/SamurAIGPT/AI-Influencer-Generator)
+Cada corrida genera una carpeta con:
 
-[Text to Video AI](https://github.com/SamurAIGPT/Text-To-Video-AI)
+```
+outputs/
+└── <video_id>/
+    ├── clips/
+    │   ├── clip_01.mp4
+    │   ├── clip_02.mp4
+    │   └── ...
+    ├── manifest.json
+    ├── transcription.txt
+    └── highlights.json
+```
 
-[Faceless Video Generator](https://github.com/SamurAIGPT/Faceless-Video-Generator)
+### Ejemplo `manifest.json`
 
-[AI B-roll generator](https://github.com/Anil-matcha/AI-B-roll)
+```json
+{
+  "video_id": "abcd1234",
+  "source_url": "https://youtube.com/watch?v=abcd1234",
+  "created_at": "2025-08-17T12:00:00Z",
+  "model": "gpt-4",
+  "whisper_model": "medium",
+  "clips": [
+    {
+      "file": "clip_01.mp4",
+      "start": "00:01:23",
+      "end": "00:02:45",
+      "score": 0.91,
+      "speaker": "Speaker 1",
+      "highlight_text": "Explicación clave del invitado..."
+    }
+  ]
+}
+```
 
-[No-code AI Youtube Shorts Generator](https://www.vadoo.tv/clip-youtube-video)
+---
 
-[Sora AI Video Generator](https://www.vadoo.tv/sora-ai-video-generator)
+## 🐳 Uso con Docker
+
+```bash
+# Construir imagen
+docker build -t ai-shorts .
+
+# Ejecutar pipeline
+docker run --rm -it \
+    -v $(pwd)/outputs:/app/outputs \
+    -e OPENAI_API_KEY=$OPENAI_API_KEY \
+    ai-shorts --url "https://youtube.com/watch?v=XXXX"
+```
+
+---
+
+## 🔧 Troubleshooting
+
+- **`ffmpeg: command not found`** → Instala FFmpeg:  
+  - Ubuntu: `sudo apt install ffmpeg`  
+  - Mac: `brew install ffmpeg`  
+  - Windows: [descargar binarios](https://ffmpeg.org/download.html)
+
+- **CUDA no disponible** → Whisper correrá en CPU (más lento).
+
+- **API Key inválida** → Verifica tu `.env` y que la cuenta de OpenAI tenga créditos.
+
+---
+
+## 📊 Roadmap
+
+- [ ] Soporte a `faster-whisper` para transcripciones más rápidas.
+- [ ] Generación de subtítulos (`.srt`) y *burn-in* opcional.
+- [ ] UI con Gradio para uso no técnico.
+- [ ] Auto-generación de thumbnails y hashtags.
+
+---
+
+## 🤝 Contribuciones
+
+¡Se aceptan PRs! 🙌  
+Si quieres colaborar, abre un *issue* o crea un *pull request*.
+
+---
+
+## 📜 Licencia
+
+[MIT](./LICENSE) © 2025
