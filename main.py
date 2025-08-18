@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 import json
+from typing import List, Dict, Any
+
 from Components.YoutubeDownloader import download_youtube_video
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
@@ -13,6 +15,7 @@ from Components.LanguageTasks import GetHighlight
 # En lugar del FaceCrop “clásico”, usa el YOLO/DNN:
 from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo
 from Components.FaceCropYOLO import mux_audio_video_nvenc
+from Components.Subtitles import generate_ass, burn_in_subtitles
 
 load_dotenv()
 logging.basicConfig(
@@ -38,15 +41,18 @@ class StepTimer:
         dt = time.time() - self.t0
         print(f"⏱️  {self.name} completado en {dt:.1f}s")
 
-def build_transcript_string(transcriptions):
+def build_transcript_string(transcriptions: List[Dict[str, Any]]):
     chunks = []
-    for text, start, end in transcriptions:
-        chunks.append(f"{start} - {end}: {text}\n")
+    for seg in transcriptions:
+        start = seg.get('start', 0.0)
+        end = seg.get('end', 0.0)
+        text = seg.get('text', '')
+        chunks.append(f"{start:.2f} - {end:.2f}: {text}\n")
     return "".join(chunks)
 
 def guess_companion_audio(final_mp4: Path) -> Path | None:
     folder = final_mp4.parent
-    cands = sorted(list(folder.glob("audio_*.*")))
+    cands = sorted(list(folder.glob("audio_*.* Willow")))
     return cands[0] if cands else None
 
 def make_project_dirs(final_mp4: Path) -> tuple[Path, Path]:
@@ -86,30 +92,26 @@ def main():
             return
         logging.info(f"Audio for ASR: {wav_path}")
 
-        hr("Transcripción (ASR)")
+        hr("Transcripción (ASR) con Word Timestamps")
         st = StepTimer("Transcripción")
         speech_json_path = wdir / "speech.json"
 
+        # TranscribeAudio ahora devuelve una lista de dicts con word-level timestamps
         transcriptions = transcribeAudio(
-        str(wav_path),
-        model_size="medium",          # o el que prefieras
-        language="es",
-        beam_size=1,
-        vad_filter=True,
-        diarization="auto",           # "auto" intenta pyannote si está disponible
-        write_speech_json_to=str(speech_json_path),
+            str(wav_path),
+            model_size="medium",
+            language="es",
+            beam_size=1,
+            vad_filter=True,
+            diarization="auto",
+            write_speech_json_to=str(speech_json_path),
         )
         st.end()
         if not transcriptions:
             logging.error("Transcription returned empty result")
             return
-
-
-        with open(speech_json_path, "w", encoding="utf-8") as f:
-            json.dump([
-                {"text": text, "start": start, "end": end}
-                for text, start, end in transcriptions
-            ], f, ensure_ascii=False, indent=2)
+        
+        # El JSON ya se guarda dentro de transcribeAudio, no es necesario hacerlo aquí.
 
         hr("Selección de highlight (LLM)")
         trans_text = build_transcript_string(transcriptions)
@@ -122,35 +124,26 @@ def main():
         hr("Recorte (Trim)")
         st = StepTimer("Recorte")
         cut_path = wdir / "cut.mp4"
-        try:
-            trim_video_ffmpeg(
-                src=str(final_mp4),
-                dst=str(cut_path),
-                start=float(start_sec),
-                end=float(end_sec),
-                copy=True  # prueba copy primero
-            )
-            logging.info("Temporal cut exported with -c copy (fast).")
-        except Exception as e:
-            logging.warning(f"Fast copy trim failed ({e}). Retrying with re-encode.")
-            trim_video_ffmpeg(
-                src=str(final_mp4),
-                dst=str(cut_path),
-                start=float(start_sec),
-                end=float(end_sec),
-                copy=False
-            )
-            logging.info("Temporal cut exported with re-encode.")
+        # Forzar siempre el re-encode para asegurar cortes precisos y evitar desincronización de subtítulos.
+        # El método de copia de stream (-c copy) puede ser impreciso si el tiempo de inicio no es un keyframe.
+        trim_video_ffmpeg(
+            src=str(final_mp4),
+            dst=str(cut_path),
+            start=float(start_sec),
+            end=float(end_sec),
+            copy=False  # <-- Forzar re-encode
+        )
+        logging.info("Temporal cut exported with re-encode for frame accuracy.")
         st.end()
 
         hr("Crop 9:16 + seguimiento")
         st = StepTimer("Crop")
         cropped_path = wdir / "cropped.mp4"
         crop_follow_face_1080x1920_yolo(
-        input_path=str(cut_path),
-        output_path=str(cropped_path),
-        speech_json=str(speech_json_path),   # 🔹 PASO NUEVO
-        static_per_speaker=True              # 🔹 NUEVO FLAG
+            input_path=str(cut_path),
+            output_path=str(cropped_path),
+            speech_json=str(speech_json_path),
+            static_per_speaker=True
         )
         st.end()
         logging.info(f"Cropped clip: {cropped_path}")
@@ -166,9 +159,47 @@ def main():
             v_bitrate="6M"
         )
         st.end()
-        print(f"\n✅ Done! Short ready at: {final_short}\n")
+        print(f"✅ Short (sin subtítulos) listo en: {final_short}")
+
+        hr("Generación de Subtítulos Dinámicos")
+        st = StepTimer("Generación de ASS y Burn-in")
+
+        # Filtrar los segmentos de la transcripción que caen en el highlight
+        highlight_segments = []
+        for segment in transcriptions:
+            seg_start = segment.get('start', 0)
+            seg_end = segment.get('end', 0)
+            if max(seg_start, start_sec) < min(seg_end, end_sec):
+                # Ajustar timestamps de los segmentos y sus palabras al inicio del clip
+                new_seg = segment.copy()
+                new_seg['start'] = seg_start - start_sec
+                new_seg['end'] = seg_end - start_sec
+                
+                new_words = []
+                if 'words' in new_seg and new_seg['words'] is not None:
+                    for word_info in new_seg['words']:
+                        new_word_info = word_info.copy()
+                        new_word_info['start'] = word_info['start'] - start_sec
+                        new_word_info['end'] = word_info['end'] - start_sec
+                        new_words.append(new_word_info)
+                new_seg['words'] = new_words
+                highlight_segments.append(new_seg)
+
+        ass_path = odir / "subtitles.ass"
+        generate_ass(highlight_segments, ass_path)
+
+        final_subtitled_short = odir / f"{final_short.stem}_subtitled.mp4"
+        burn_in_subtitles(
+            video_path=final_short,
+            subtitle_path=ass_path,
+            output_path=final_subtitled_short
+        )
+        st.end()
+
+        print(f"\n✅ Done! Short final con subtítulos dinámicos en: {final_subtitled_short}\n")
 
     except KeyboardInterrupt:
+
         print("\nInterrupted by user.")
     except Exception as e:
         logging.exception(f"Fatal error: {e}")

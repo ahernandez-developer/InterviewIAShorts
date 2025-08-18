@@ -359,7 +359,7 @@ def crop_follow_face_1080x1920_yolo(
     static_per_speaker: bool = False,
 ):
     """
-    - Si static_per_speaker=True y speech_json existe: fija una ventana por turno de hablante.
+    - Si static_per_speaker=True y speech_json existe: fija una ventana por turno de hablante con transiciones suaves.
     - Si no: usa modo dinámico estabilizado (paneo+zoom) con mejoras.
     """
     _ensure_parent(output_path)
@@ -370,7 +370,6 @@ def crop_follow_face_1080x1920_yolo(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     writer = _open_writer_with_fallback(output_path, fps)
 
-    # Turnos
     turns = _load_turns(speech_json, fps) if static_per_speaker and speech_json else []
     use_static = static_per_speaker and len(turns) > 0
 
@@ -379,23 +378,26 @@ def crop_follow_face_1080x1920_yolo(
     frame_idx = 0
     last_face = None
 
-    # Estado del modo dinámico (fallback)
+    # --- Estado del modo dinámico (fallback) ---
     stabilizer = None
-    zoomer     = None
+    zoomer = None
 
-    # Estado del modo estático por turno
+    # --- Estado del modo estático por turno ---
     current_turn = -1
-    anchor_cx: Optional[float] = None  # centro fijo por turno
-    anchor_win_w: Optional[int] = None # ancho fijo por turno
+    # Valores finales del ancla para el turno actual
+    target_anchor_cx: Optional[float] = None
+    target_anchor_win_w: Optional[int] = None
+    # Valores de la rampa de transición
+    static_ramp_frames_left = 0
+    static_ramp_total_frames = 0
+    start_anchor_cx, start_anchor_win_w = 0.0, 0
+    # Valores a usar en el frame actual (pueden estar en plena rampa)
+    current_cx, current_win_w = 0.0, 0
 
-    # Tracker para continuidad entre detecciones
     tracker = None
     tracker_ok = False
-
-    # Anti-cut
     prev_gray = None
     cut_cooldown = 0
-
     t0 = time.time()
 
     while True:
@@ -403,49 +405,39 @@ def crop_follow_face_1080x1920_yolo(
         if not ok:
             break
         frame_idx += 1
-        if frame is None:
-            continue
+        if frame is None: continue
         if frame.shape[2] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-        # trabajamos a altura fija
         frs, W, H, scale = _resize_to_h(frame)
 
-        # --- detección cara en coords del frame original ---
+        if current_cx == 0.0: # Inicialización en el primer frame
+            current_cx, start_anchor_cx, target_anchor_cx = W / 2.0, W / 2.0, W / 2.0
+            current_win_w, start_anchor_win_w, target_anchor_win_w = int(OUT_W * 1.20), int(OUT_W * 1.20), int(OUT_W * 1.20)
+
+
         face = detector.detect(frame)
         detected = face is not None
 
-        # Si detectó: llevar a espacio redimensionado y expandir
         if detected:
             x, y, w, h = face
-            # llevar a espacio redimensionado
-            x = int(round(x * scale)); y = int(round(y * scale))
-            w = int(round(w * scale)); h = int(round(h * scale))
+            x, y, w, h = (int(round(c * scale)) for c in (x, y, w, h))
             x, y, w, h = _expand_bbox(x, y, w, h, FACE_SCALE_BOX, W, H)
             last_face = (x, y, w, h)
-
-            # (re)inicializa tracker con la cara actual
             try:
                 tracker = cv2.legacy.TrackerCSRT_create()
+                if tracker is not None:
+                    tracker_ok = tracker.init(frs, tuple(last_face))
             except AttributeError:
-                # OpenCV sin módulo legacy: desactiva tracking
                 tracker = None
-            if tracker is not None:
-                tracker_ok = tracker.init(frs, tuple(last_face))
-        else:
-            # intenta mantener continuidad con tracker
-            if tracker is not None and tracker_ok:
-                tracker_ok, bbox = tracker.update(frs)
-                if tracker_ok:
-                    x, y, w, h = map(int, bbox)
-                    x, y, w, h = _expand_bbox(x, y, w, h, 1.0, W, H)
-                    last_face = (x, y, w, h)
-                    detected = True  # tratamos como “cara válida” para continuidad
+        elif tracker is not None and tracker_ok:
+            tracker_ok, bbox = tracker.update(frs)
+            if tracker_ok:
+                x, y, w, h = map(int, bbox)
+                last_face = _expand_bbox(x, y, w, h, 1.0, W, H)
+                detected = True
 
-        # tiempo actual
         tsec = frame_idx / float(fps)
-
-        # Anti-cut: detecta cambios de plano para reset suave
         gray = cv2.cvtColor(frs, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
             diff = cv2.absdiff(prev_gray, gray)
@@ -455,44 +447,58 @@ def crop_follow_face_1080x1920_yolo(
                     stabilizer.ramp_frames_left = CUT_RAMP_FRAMES
                 if zoomer is not None:
                     max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
-                    zoomer.win_w = int(min(zoomer.win_w * 1.15, max_win))  # pequeño zoom-out
+                    zoomer.win_w = int(min(zoomer.win_w * 1.15, max_win))
                 cut_cooldown = int(fps * CUT_COOLDOWN_SEC)
         prev_gray = gray
         cut_cooldown = max(0, cut_cooldown - 1)
 
-        # -------------------
-        #      MODO ESTÁTICO
-        # -------------------
+        # ------------------
+        # MODO ESTÁTICO
+        # ------------------
         if use_static:
-            # ¿cambió el turno?
             idx = _find_turn_index(turns, tsec)
             if idx != current_turn:
                 current_turn = idx
-                anchor_cx, anchor_win_w = None, None
+                
+                # --- Iniciar transición a un nuevo ancla ---
+                start_anchor_cx = current_cx
+                start_anchor_win_w = current_win_w
+                
+                max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
+                
                 if current_turn >= 0:
                     if last_face is not None:
                         fx, fy, fw, fh = last_face
-                        anchor_cx = fx + fw/2.0
+                        target_anchor_cx = fx + fw / 2.0
                         target_w = int(round(max(fw / max(FACE_TARGET_RATIO, 1e-4), int(OUT_W * 1.15))))
-                        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
-                        anchor_win_w = int(np.clip(target_w, OUT_W, max_win))
-                    else:
-                        anchor_cx = W / 2.0
-                        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
-                        anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
-                else:
-                    anchor_cx = W / 2.0
-                    max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
-                    anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
+                        target_anchor_win_w = int(np.clip(target_w, OUT_W, max_win))
+                    else: # Si no hay cara, centrar
+                        target_anchor_cx = W / 2.0
+                        target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
+                else: # Si no hay turno, plano general
+                    target_anchor_cx = W / 2.0
+                    target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
 
-            # aplicar recorte estático
-            cx = float(anchor_cx if anchor_cx is not None else (W/2.0))
-            win_w = int(anchor_win_w if anchor_win_w is not None else OUT_W)
-            half = win_w / 2.0
-            left = int(round(cx - half))
-            left = max(0, min(W - win_w, left))
+                # Duración de la rampa (0.5s)
+                static_ramp_total_frames = int(fps * 0.5)
+                static_ramp_frames_left = static_ramp_total_frames
 
-            # Sesgo vertical suave (empujar un poco hacia arriba)
+            # --- Aplicar rampa de transición si está activa ---
+            if static_ramp_frames_left > 0:
+                t = 1.0 - (static_ramp_frames_left / float(static_ramp_total_frames))
+                t2 = 3*t*t - 2*t*t*t  # Ease-in-out
+                current_cx = (1.0 - t2) * start_anchor_cx + t2 * target_anchor_cx
+                current_win_w = (1.0 - t2) * start_anchor_win_w + t2 * target_anchor_win_w
+                static_ramp_frames_left -= 1
+            else:
+                current_cx = target_anchor_cx
+                current_win_w = target_anchor_win_w
+
+            # Aplicar recorte estático (o en transición)
+            half = current_win_w / 2.0
+            left = int(round(current_cx - half))
+            left = max(0, min(W - int(current_win_w), left))
+
             if last_face is not None:
                 _, fy, _, fh = last_face
                 bias = int(min(OUT_H * 0.06, fh * 0.25))
@@ -500,15 +506,16 @@ def crop_follow_face_1080x1920_yolo(
                 bias = int(OUT_H * 0.04)
             frs_bias = cv2.copyMakeBorder(frs, bias, 0, 0, 0, cv2.BORDER_REFLECT_101)
 
-            win = frs_bias[:, left:left+win_w]
+            win = frs_bias[:, left:left+int(current_win_w)]
             crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
             crop = np.ascontiguousarray(crop, dtype=np.uint8)
             writer.write(crop)
 
-        # -------------------
-        #      MODO DINÁMICO
-        # -------------------
+        # ------------------
+        # MODO DINÁMICO
+        # ------------------
         else:
+            # ... (el modo dinámico no se modifica)
             if stabilizer is None:
                 stabilizer = CinematicStabilizer(W)
             if zoomer is None:
@@ -526,22 +533,15 @@ def crop_follow_face_1080x1920_yolo(
                     cx_target = W / 2.0
                     face_for_zoom = None
 
-            # Centro suavizado
             cx = stabilizer.update_target(cx_target, detected)
-
-            # Lead room: desplaza el objetivo según la velocidad horizontal
             lead = np.clip(stabilizer.vx * 1.8, -OUT_W * 0.12, OUT_W * 0.12)
             cx   = np.clip(cx + lead, OUT_W/2 + EDGE_MARGIN, W - OUT_W/2 - EDGE_MARGIN)
-
-            # Zoom consciente de movimiento y confianza
             face_conf = getattr(detector, "last_conf", 1.0)
             win_w = zoomer.update(face_for_zoom, cx, face_conf=face_conf, face_vx=stabilizer.vx)
-
             half  = win_w / 2.0
             left = int(round(cx - half))
             left = max(0, min(W - win_w, left))
 
-            # Sesgo vertical suave (mantener ojos cerca del tercio superior)
             if last_face is not None:
                 _, fy, _, fh = last_face
                 bias = int(min(OUT_H * 0.06, fh * 0.25))
@@ -554,7 +554,6 @@ def crop_follow_face_1080x1920_yolo(
             crop = np.ascontiguousarray(crop, dtype=np.uint8)
             writer.write(crop)
 
-        # log de rendimiento
         if frame_idx % 60 == 0:
             elapsed = round(time.time() - t0, 2)
             mode = "static" if use_static else "dynamic"

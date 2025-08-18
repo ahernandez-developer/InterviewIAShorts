@@ -7,7 +7,7 @@ import json
 import math
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 # Transcripción (GPU si hay) con faster-whisper
 from faster_whisper import WhisperModel
@@ -60,9 +60,9 @@ def _progress_bar(done: float, total: float, width: int = 30) -> str:
     return f"[{'█'*done_w}{'.'*(width-done_w)}] {ratio*100:5.1f}%"
 
 
-def _save_speech_json(segments: List[dict], dst: Path) -> None:
+def _save_speech_json(segments: List[Dict[str, Any]], dst: Path) -> None:
     """
-    segments: lista de dicts con: speaker, start, end, text
+    Guarda la lista de segmentos (en formato dict) a un JSON.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     with open(dst, "w", encoding="utf-8") as f:
@@ -118,51 +118,57 @@ def _try_diarization_pyannote(
 
 
 def _merge_transcript_with_regions(
-    transcript: List[Tuple[str, float, float]],
+    transcript_segments: list, # List of faster-whisper Segment objects
     regions: Optional[List[dict]]
-) -> List[dict]:
+) -> List[Dict[str, Any]]:
     """
-    Junta transcripción (text/start/end) con regiones de speaker (start/end)
+    Junta transcripción (con word-timestamps) con regiones de speaker.
     Asigna texto al speaker cuyo intervalo solape más.
     Si no hay regions -> asigna todo a SPEAKER_0.
+    Devuelve una lista de diccionarios, cada uno representando un segmento.
     """
     out = []
     if not regions:
-        for (text, start, end) in transcript:
+        for seg in transcript_segments:
+            words_list = [{
+                "word": w.word, "start": w.start, "end": w.end, "probability": w.probability
+            } for w in getattr(seg, 'words', [])]
             out.append({
                 "speaker": "SPEAKER_0",
-                "start": float(start),
-                "end": float(end),
-                "text": text
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": seg.text,
+                "words": words_list
             })
         return out
 
-    i = 0
-    for (text, s, e) in transcript:
+    region_idx = 0
+    for seg in transcript_segments:
+        s, e = seg.start, seg.end
         if s is None or e is None:
-            out.append({
-                "speaker": "SPEAKER_0",
-                "start": float(s or 0.0),
-                "end": float(e or (s or 0.0)),
-                "text": text
-            })
             continue
 
         best_idx, best_overlap = 0, 0.0
-        for j in range(max(0, i - 2), min(len(regions), i + 10)):
+        # Search in a window around the last used region index
+        for j in range(max(0, region_idx - 2), min(len(regions), region_idx + 10)):
             rs, re = regions[j]["start"], regions[j]["end"]
             ov = max(0.0, min(e, re) - max(s, rs))
             if ov > best_overlap:
                 best_overlap = ov
                 best_idx = j
-        i = best_idx
+        region_idx = best_idx
 
         spk = regions[best_idx]["speaker"]
+        words_list = [{
+            "word": w.word, "start": w.start, "end": w.end, "probability": w.probability
+        } for w in getattr(seg, 'words', [])]
+        
         out.append({
             "speaker": spk,
             "start": float(s),
             "end": float(e),
-            "text": text
+            "text": seg.text,
+            "words": words_list
         })
 
     return out
@@ -209,15 +215,14 @@ def transcribeAudio(
     vad_filter: bool = True,
     diarization: str = "auto",
     write_speech_json_to: Optional[str] = None,
-) -> List[Tuple[str, float, float]]:
+) -> List[Dict[str, Any]]: # Return type changed
     """
-    Transcribe un WAV (16k mono recomendado) con faster-whisper.
-    Devuelve lista de (text, start, end).
+    Transcribe un WAV y devuelve una lista de segmentos, cada uno como un diccionario
+    con texto, tiempos, speaker y word-level timestamps.
     """
     wav_path = str(wav_path)
-    audio_dur = _probe_duration_ffprobe(wav_path)  # solo para progreso “bonito”
+    audio_dur = _probe_duration_ffprobe(wav_path)
 
-    # Dispositivo y cache local del modelo (sin symlinks en Windows)
     device, compute_type = _pick_device_and_compute_type()
     model_dir = MODELS_DIR / f"faster-whisper-{model_size}"
     model_dir.mkdir(exist_ok=True, parents=True)
@@ -236,34 +241,28 @@ def transcribeAudio(
         download_root=str(model_dir),
     )
 
-    # Opciones del decoder (todas soportadas en versiones recientes)
+    # Opciones del decoder: AÑADIMOS word_timestamps=True
     gen_opts = dict(
-        language=language,               # None = autodetección
-        beam_size=beam_size,             # 1 = greedy (rápido)
-        vad_filter=vad_filter,           # filtra silencios
-        condition_on_previous_text=True, # contexto entre segmentos
-        # best_of y patience aplican solo con sampling; beam_size>1 usa beam search
+        language=language,
+        beam_size=beam_size,
+        vad_filter=vad_filter,
+        condition_on_previous_text=True,
+        word_timestamps=True  # <-- LA CLAVE DEL CAMBIO
     )
 
-    # ✅ OJO: transcribe devuelve (segments_generator, info)
     segments_gen, info = model.transcribe(wav_path, **gen_opts)
 
-    segments_out: List[Tuple[str, float, float]] = []
+    # El generador ahora se consume en una lista para pasarlo a la diarización
+    raw_segments = []
     last_print = time.time()
     t_load = time.time() - t0
     total_done = 0.0
 
     for seg in segments_gen:
-        # Cada `seg` tiene .text, .start, .end
-        text = (seg.text or "").strip()
-        start = float(seg.start or 0.0)
-        end = float(seg.end or start)
-
-        if text:
-            segments_out.append((text, start, end))
-
+        raw_segments.append(seg)
+        
         # Progreso
-        total_done = end
+        total_done = seg.end
         now = time.time()
         if audio_dur and (now - last_print) > 0.5:
             bar = _progress_bar(total_done, audio_dur, width=28)
@@ -274,27 +273,32 @@ def transcribeAudio(
             logger.info(f"[ASR] {bar} | {total_done:6.2f}/{audio_dur:6.2f}s | ETA {_format_time(eta_s)}")
             last_print = now
 
-    # Línea final al 100%
     if audio_dur:
         bar = _progress_bar(audio_dur, audio_dur, width=28)
         logger.info(f"[ASR] {bar} | {audio_dur:6.2f}/{audio_dur:6.2f}s")
 
-    # ---------- (Opcional) diarización + speech.json ----------
-    speech_items: Optional[List[dict]] = None
+    # Diarización (si está activada)
+    speech_regions: Optional[List[dict]] = None
     do_diar = (diarization or "none").lower()
-    try:
-        if do_diar in ("auto", "pyannote"):
-            speech_items = _try_diarization_pyannote(wav_path)
-    except Exception as e:
-        logger.warning(f"Diarización fallida: {e}")
+    if do_diar in ("auto", "pyannote"):
+        try:
+            speech_regions = _try_diarization_pyannote(wav_path)
+        except Exception as e:
+            logger.warning(f"Diarización fallida: {e}")
 
-    merged = _merge_transcript_with_regions(segments_out, speech_items)
+    # Unir transcripción y diarización
+    merged_segments = _merge_transcript_with_regions(raw_segments, speech_regions)
+    
     if write_speech_json_to:
-        _save_speech_json(merged, Path(write_speech_json_to))
+        # Usamos la función _save_speech_json original, que dumpea diccionarios.
+        # El cambio principal es que ahora merged_segments tiene la data de las palabras.
+        _save_speech_json(merged_segments, Path(write_speech_json_to))
 
     logger.info(f"Model cached at: {model_dir}")
     logger.info(f"Transcripción completada en {time.time() - t0:.1f}s")
-    return segments_out
+    
+    # Devolvemos la lista de diccionarios con toda la info
+    return merged_segments
 
 
 
