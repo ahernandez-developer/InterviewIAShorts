@@ -88,6 +88,8 @@ def main():
 
         hr("Transcripción (ASR)")
         st = StepTimer("Transcripción")
+        speech_json_path = wdir / "speech.json"
+
         transcriptions = transcribeAudio(
         str(wav_path),
         model_size="medium",          # o el que prefieras
@@ -95,14 +97,14 @@ def main():
         beam_size=1,
         vad_filter=True,
         diarization="auto",           # "auto" intenta pyannote si está disponible
-        write_speech_json_to=str(wdir / "speech.json"),
+        write_speech_json_to=str(speech_json_path),
         )
         st.end()
         if not transcriptions:
             logging.error("Transcription returned empty result")
             return
 
-        speech_json_path = wdir / "speech.json"
+
         with open(speech_json_path, "w", encoding="utf-8") as f:
             json.dump([
                 {"text": text, "start": start, "end": end}
