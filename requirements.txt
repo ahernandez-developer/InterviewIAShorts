@@ -14,3 +14,4 @@ ultralytics>=8.0.0 # Added for YOLO
 pyannote.audio>=3.0.0 # Added for diarization (optional)
 # Removed: ffmpeg, ffmpeg-python, moviepy, webrtcvad-wheels, pydub (not directly imported/used as Python packages)
 --extra-index-url https://download.pytorch.org/whl/cu121
+OneEuroFilter==1.0.1 

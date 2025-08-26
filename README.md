@@ -84,15 +84,27 @@ El desarrollo del "Generador de Shorts Virales con IA" sigue un enfoque iterativ
 
 ### Próximos Pasos (Priorizado)
 
-#### Fase 1: Refinamiento y Estabilidad (v0.2)
+#### Fase 1.5: Calidad de Edición Profesional (Prioridad Actual)
 
-En esta fase, nos enfocaremos en mejorar la base del proyecto, la estructura del código y la experiencia de usuario en cuanto a la gestión de archivos.
+*El objetivo de esta fase es asegurar que cada clip generado cumpla con un estándar de calidad profesional, con una duración consistente y una edición visual de alto impacto.*
 
-- [ ] **Refactorización de la Estructura de Código:**
-    - [ ] **Dividir `main.py`:** Extraer la lógica de cada paso del pipeline en funciones o clases dedicadas dentro de sus respectivos módulos en `Components/`. `main.py` debería ser principalmente un orquestador de alto nivel.
-    - [ ] **Consolidar Utilidades:** Revisar `Components/SafeName.py` y las funciones de slug/date prefix en `Components/YoutubeDownloader.py` para crear una única utilidad de nombrado seguro en `Components/common_utils.py` (o similar).
-    - [ ] **Eliminar Código Obsoleto/No Usado:** Remover `Components/Speaker.py` y `Components/SpeakerDetection.py` ya que sus funcionalidades han sido reemplazadas por `FaceCropYOLO.py` y la diarización de `pyannote`.
-    - [ ] **Revisar `Components/Edit.py` y `Components/common_ffmpeg.py`:** Asegurar que las funciones de FFmpeg estén organizadas de la manera más lógica, quizás moviendo `_ffmpeg_path` y `_ensure_parent` a `common_ffmpeg.py` si no están ya allí, y asegurando que `Edit.py` solo contenga funciones de edición de alto nivel.
+- [x] **Consistencia en la Duración del Clip:**
+    - [x] Modificar el prompt y la lógica en `LanguageTasks.py` para instruir al LLM a seleccionar un *highlight* que dure estrictamente **entre 50 y 70 segundos**.
+- [x] **Edición y Seguimiento de Cámara Profesional:**
+    - [x] **Refinamiento del Seguimiento Facial:** Se implementaron mejoras significativas en `FaceCropYOLO.py` para asegurar un seguimiento de caras más suave y natural. Esto incluyó:
+        -   **Corrección de la Relación de Aspecto:** Eliminación de estiramientos visuales al garantizar que la ventana de recorte siempre mantenga una relación de aspecto 9:16.
+        -   **Seguimiento Robusto del Hablante:** Mejora del centrado de la cámara y reducción de momentos en los que apunta a "nada", mediante la alineación de los timestamps de `speech.json` con el video recortado y una lógica de búsqueda de turnos más tolerante.
+    - [ ] **Transiciones Cinematográficas:** Mejorar las transiciones entre hablantes. Investigar y aplicar curvas de animación más sofisticadas (e.g., *ease-in-out*) y paneos/zooms más sutiles para un acabado profesional.
+
+#### Fase 1: Refinamiento y Estabilidad (v0.2) - ¡Completada!
+
+En esta fase, nos enfocamos en mejorar la base del proyecto, la estructura del código y la experiencia de usuario en cuanto a la gestión de archivos.
+
+- [x] **Refactorización de la Estructura de Código:**
+    - [x] **Dividir `main.py`:** Extraer la lógica de cada paso del pipeline en funciones o clases dedicadas dentro de sus respectivos módulos en `Components/`. `main.py` debería ser principalmente un orquestador de alto nivel.
+    - [x] **Consolidar Utilidades:** Revisar `Components/SafeName.py` y las funciones de slug/date prefix en `Components/YoutubeDownloader.py` para crear una única utilidad de nombrado seguro en `Components/common_utils.py` (o similar).
+    - [x] **Eliminar Código Obsoleto/No Usado:** Remover `Components/Speaker.py` y `Components/SpeakerDetection.py` ya que sus funcionalidades han sido reemplazadas por `FaceCropYOLO.py` y la diarización de `pyannote`.
+    - [x] **Revisar `Components/Edit.py` y `Components/common_ffmpeg.py`:** Asegurar que las funciones de FFmpeg estén organizadas de la manera más lógica, quizás moviendo `_ffmpeg_path` y `_ensure_parent` a `common_ffmpeg.py` si no están ya allí, y asegurando que `Edit.py` solo contenga funciones de edición de alto nivel.
 
 - [ ] **Gestión de Archivos de Salida:**
     - [ ] **Manejo de Sobrescritura:** Implementar una lógica en `main.py` (o en las funciones de guardado de cada componente) que pregunte al usuario si desea sobrescribir los archivos existentes si se intenta procesar el mismo video nuevamente. Alternativamente, generar un sufijo único (e.g., `_run2`) si el usuario no desea sobrescribir.
@@ -104,7 +116,7 @@ En esta fase, nos enfocaremos en mejorar la base del proyecto, la estructura del
 
 Esta fase se centrará en añadir más "inteligencia" al proceso de edición y permitir una mayor personalización del resultado final.
 
-- [ ] **Mejoras de IA:** Auto-generación de títulos, descripciones y hashtags para los clips.
+- [x] **Mejoras de IA:** Auto-generación de títulos, descripciones y hashtags para los clips.
 - [ ] **Análisis de Contenido Avanzado:** Detección de temática, tono y otros metadatos relevantes del video para una edición más inteligente.
     - [ ] **Detección de Picos Emocionales:** Identificar momentos de alta emoción (risa, sorpresa, enojo, etc.) en audio/video.
     - [ ] **Análisis de Sentimiento del Texto:** Clasificar el tono del segmento (humorístico, serio, etc.).

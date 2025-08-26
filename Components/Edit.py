@@ -6,24 +6,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from Components.common_ffmpeg import run_ffmpeg_with_progress
-
-def _ffmpeg_path() -> str:
-    exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
-    ff = shutil.which(exe)
-    if not ff:
-        raise EnvironmentError("FFmpeg no encontrado en PATH.")
-    return ff
-
-def _ensure_parent(p: str | Path):
-    Path(p).parent.mkdir(parents=True, exist_ok=True)
+from Components.common_ffmpeg import run_ffmpeg_with_progress, _ffmpeg_path
+from Components.common_utils import ensure_parent_directory_exists
 
 def extract_audio_wav(src: str, wav: str, sr: int = 16000):
     """
     Extrae WAV mono 16k del contenedor de origen (mp4/m4a/webm/etc).
     """
     ff = _ffmpeg_path()
-    _ensure_parent(wav)
+    ensure_parent_directory_exists(wav)
     cmd = [
         ff, "-i", src,
         "-vn",
@@ -43,7 +34,7 @@ def trim_video_ffmpeg(src: str, dst: str, start: float, end: float, fps: int = 3
     - copy=False: recorta con re-encode (usa NVENC si tu comando global ya lo hace).
     """
     ff = _ffmpeg_path()
-    _ensure_parent(dst)
+    ensure_parent_directory_exists(dst)
     duration = max(0.0, end - start)
     if copy:
         cmd = [

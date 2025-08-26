@@ -33,6 +33,8 @@ Style: Default,{font_name},{font_size},&H00{primary_color},&H000000FF,&H00{outli
 def generate_ass(
     transcriptions: List[Dict[str, Any]],
     ass_path: str | Path,
+    start_sec: float,
+    end_sec: float,
     font_name: str = "Impact",
     font_size: int = 65,
     primary_color: str = "FFFFFF", # White
@@ -43,8 +45,35 @@ def generate_ass(
     max_words_per_line: int = 8, # Safety break for long lines
 ) -> None:
     """
-    Generates a .ass file with dynamic subtitles grouped by speech pauses.
+    Generates a .ass file with dynamic subtitles grouped by speech pauses,
+    only for the highlighted segment.
     """
+    # Filter and adjust timestamps for the highlight
+    highlight_segments = []
+    for segment in transcriptions:
+        seg_start = segment.get('start', 0)
+        seg_end = segment.get('end', 0)
+        if max(seg_start, start_sec) < min(seg_end, end_sec):
+            new_seg = segment.copy()
+            # Adjust segment times to be relative to the highlight start
+            new_seg['start'] = seg_start - start_sec
+            new_seg['end'] = seg_end - start_sec
+            
+            new_words = []
+            if 'words' in new_seg and new_seg['words'] is not None:
+                for word_info in new_seg['words']:
+                    # Only include words that are actually within the highlight
+                    if word_info['start'] >= start_sec and word_info['end'] <= end_sec:
+                        new_word_info = word_info.copy()
+                        # Adjust word times to be relative
+                        new_word_info['start'] = word_info['start'] - start_sec
+                        new_word_info['end'] = word_info['end'] - start_sec
+                        new_words.append(new_word_info)
+            new_seg['words'] = new_words
+            
+            if new_seg['words']: # Only add segments that have words after filtering
+                highlight_segments.append(new_seg)
+
     ass_path = Path(ass_path)
     ass_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -61,13 +90,13 @@ def generate_ass(
         f.write(header.strip() + "\n\n[Events]\n")
         f.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
 
-        for segment in transcriptions:
+        for segment in highlight_segments: # Use the filtered segments
             words = segment.get("words", [])
             if not words:
                 continue
             
             word_buffer = []
-            # Use the segment start time as the initial end time for gap calculation
+            # Use the adjusted segment start time
             last_word_end = segment.get('start', 0)
 
             def write_buffer(buf):
@@ -80,13 +109,11 @@ def generate_ass(
                 f.write(dialogue_line + "\n")
 
             for word_info in words:
-                # Skip words that are just punctuation or have no text
                 if not word_info.get('word') or not word_info.get('word').strip():
                     continue
 
                 gap = word_info['start'] - last_word_end
                 
-                # Flush buffer if there's a significant pause or the line is getting too long
                 if word_buffer and (gap > max_gap_seconds or len(word_buffer) >= max_words_per_line):
                     write_buffer(word_buffer)
                     word_buffer = []
@@ -94,7 +121,6 @@ def generate_ass(
                 word_buffer.append(word_info)
                 last_word_end = word_info['end']
 
-            # Write any remaining words in the buffer after the loop
             if word_buffer:
                 write_buffer(word_buffer)
 

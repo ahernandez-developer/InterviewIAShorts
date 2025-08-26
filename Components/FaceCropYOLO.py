@@ -10,6 +10,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 import cv2
+from OneEuroFilter import OneEuroFilter
 
 # ============================
 #     PARÁMETROS GLOBALES
@@ -17,33 +18,30 @@ import cv2
 
 # Salida vertical 9:16
 OUT_W, OUT_H = 1080, 1920
+TARGET_ASPECT_RATIO = OUT_W / OUT_H # 0.5625 for 9:16
 
 # Detección
 DET_SIZE = 640
 CONF_THR = 0.35
 FACE_SCALE_BOX = 1.50  # expandir bbox para no cortar frente/mentón
 
-# Estabilización de paneo (modo dinámico)
-DEADZONE_PX = 24          # zona muerta alrededor del objetivo (px)
-MAX_STEP_PX = 18          # avance máximo del centro por frame
-SPRING_K    = 0.10        # ganancia del “muelle”
-DAMPING     = 0.90        # amortiguación de la velocidad
-TARGET_MEDIAN_WIN = 7     # mediana temporal del centro objetivo
-CUT_JUMP_THRESH  = 260    # si el objetivo salta mucho, rampa
-CUT_RAMP_FRAMES  = 14     # frames de rampa (ease-in-out) al saltar
-MISS_HYSTERESIS  = 10     # frames tolerados sin detección
-EDGE_MARGIN      = 48     # margen para no pegar al borde
+# --- Parámetros del One Euro Filter ---
+# Un valor más bajo en min_cutoff aumenta el suavizado (y el lag).
+# Un valor más alto en beta permite que el filtro reaccione más rápido a cambios bruscos.
+POS_MIN_CUTOFF = 0.5
+POS_BETA = 0.5
+ZOOM_MIN_CUTOFF = 0.8
+ZOOM_BETA = 1.0
 
-# Zoom dinámico (modo dinámico)
-FACE_TARGET_RATIO = 0.28  # cara ≈ 28% del ancho de la ventana
-ZOOM_ALPHA        = 0.08  # suavizado EMA del ancho de ventana
-ZOOM_MAX_STEP     = 18    # cambio máx. por frame (px)
-ZOOM_MIN_WIN      = int(OUT_W * 1.05)  # zoom-in máximo (más conservador)
-ZOOM_MAX_WIN_MULT = 1.90  # zoom-out máximo relativo a OUT_W
+# --- Parámetros de Composición de Escena ---
+FACE_TARGET_RATIO = 0.28  # La cara debe ocupar ~28% del ancho del cuadro
+EDGE_MARGIN = 48
+ZOOM_MIN_WIN = int(OUT_W * 1.05)
+ZOOM_MAX_WIN_MULT = 1.90
 
 # Anti-cut (detección de cambio de plano)
-CUT_DIFF_THR      = 18.0   # umbral de diferencia media para detectar corte
-CUT_COOLDOWN_SEC  = 0.5    # no re-disparar de inmediato
+CUT_DIFF_THR = 18.0
+CUT_COOLDOWN_SEC = 0.5
 
 
 # ============================
@@ -190,110 +188,77 @@ def _pick_detector():
 
 
 # ============================
-#     ESTABILIZADORES (dinámico)
+#     ESTABILIZADOR (One Euro Filter)
 # ============================
 
-class CinematicStabilizer:
-    """ Paneo horizontal suave con mediana temporal + spring-damper + deadband + ramp. """
-    def __init__(self, width: int):
-        self.W = width
-        self.cx_smoothed = width / 2.0
-        self.vx = 0.0
-        self.median_buf = deque(maxlen=TARGET_MEDIAN_WIN)
-        self.miss_count = 0
-        self.ramp_frames_left = 0
-        self.ramp_start = None
-        self.ramp_end = None
-
-    def update_target(self, cx_target: float, detected: bool):
-        if detected:
-            self.miss_count = 0
-            self.median_buf.append(cx_target)
-            cx_med = np.median(self.median_buf) if self.median_buf else cx_target
-        else:
-            self.miss_count += 1
-            cx_med = np.median(self.median_buf) if self.median_buf else self.cx_smoothed
-
-        delta = abs(cx_med - self.cx_smoothed)
-        if delta > CUT_JUMP_THRESH:
-            self.ramp_frames_left = CUT_RAMP_FRAMES
-            self.ramp_start = self.cx_smoothed
-            self.ramp_end = cx_med
-
-        if self.ramp_frames_left > 0:
-            t = 1.0 - (self.ramp_frames_left / float(CUT_RAMP_FRAMES))
-            t2 = 3*t*t - 2*t*t*t  # ease-in-out cúbica
-            cx_goal = (1.0 - t2) * self.ramp_start + t2 * self.ramp_end
-            self.ramp_frames_left -= 1
-        else:
-            cx_goal = cx_med
-
-        err = cx_goal - self.cx_smoothed
-        if abs(err) < DEADZONE_PX:
-            err = 0.0
-
-        ax = SPRING_K * err
-        self.vx = DAMPING * (self.vx + ax)
-        self.vx = max(-MAX_STEP_PX, min(MAX_STEP_PX, self.vx))
-        self.cx_smoothed += self.vx
-
-        half = OUT_W / 2.0
-        min_cx = half + EDGE_MARGIN
-        max_cx = self.W - half - EDGE_MARGIN
-        self.cx_smoothed = max(min_cx, min(max_cx, self.cx_smoothed))
-        return self.cx_smoothed
-
-class ZoomManager:
-    """ Mantiene el ancho de la ventana (win_w) según tamaño de cara, movimiento y seguridad en bordes. """
-    def __init__(self, frame_width: int):
+class OneEuroStabilizer:
+    """Aplica OneEuroFilter a la posición y tamaño de la cara para un seguimiento suave."""
+    def __init__(self, freq: float, frame_width: int, frame_height: int):
         self.W = frame_width
-        self.win_w = OUT_W
+        self.H = frame_height
+        
+        # Filtros para la posición del centro de la cara
+        self.filter_x = OneEuroFilter(freq, POS_MIN_CUTOFF, POS_BETA, 1.0)
+        self.filter_y = OneEuroFilter(freq, POS_MIN_CUTOFF, POS_BETA, 1.0)
+        
+        # Filtro para el ancho de la ventana de recorte (controla el zoom)
+        self.filter_win_w = OneEuroFilter(freq, ZOOM_MIN_CUTOFF, ZOOM_BETA, 1.0)
 
-    def update(self, face_box, cx_crop: float, face_conf: float = 1.0, face_vx: float = 0.0):
-        W = self.W
-        min_win = max(ZOOM_MIN_WIN, OUT_W)
-        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
+        # Estado interno
+        self.cx = frame_width / 2.0
+        self.cy = frame_height / 2.0
+        self.win_w = OUT_W * 1.2
 
+    def update(self, face_box: Optional[Tuple[int, int, int, int]], t: float) -> Tuple[float, float, float]:
+        """
+        Actualiza el estabilizador con la nueva detección de cara.
+        Devuelve (centro_x_suavizado, centro_y_suavizado, ancho_ventana_suavizado).
+        """
         if face_box is not None:
             x, y, w, h = face_box
-            target_by_face = int(round(max(w / max(FACE_TARGET_RATIO, 1e-4), min_win)))
+            # El objetivo es el centro de la cara detectada
+            target_cx = x + w / 2.0
+            target_cy = y + h / 2.0
+            # El objetivo del zoom es mantener la cara a un tamaño constante en pantalla
+            target_win_w = w / max(FACE_TARGET_RATIO, 1e-4)
         else:
-            target_by_face = int(round(min(OUT_W * 1.10, max_win)))
+            # Si no hay cara, el objetivo es el estado actual (mantener la cámara quieta)
+            target_cx = self.cx
+            target_cy = self.cy
+            target_win_w = self.win_w
 
-        # Evita acercarse si hay movimiento o baja confianza
-        motion_penalty = 1.0 + min(abs(face_vx) / 24.0, 0.6)   # hasta +60%
-        conf_penalty   = 1.0 + max(0.0, 0.6 - min(face_conf, 0.6))  # penaliza conf < 0.6
-        target_by_face = int(round(target_by_face * max(motion_penalty, conf_penalty)))
+        # Aplicar filtros de One Euro
+        self.cx = self.filter_x(target_cx, t)
+        self.cy = self.filter_y(target_cy, t)
+        self.win_w = self.filter_win_w(target_win_w, t)
 
-        # Protege cuando la cara está cerca de los bordes de la ventana actual
-        protect = self.win_w
-        if face_box is not None:
-            x, y, w, h = face_box
-            face_cx = x + w/2.0
-            half = self.win_w / 2.0
-            left_edge  = cx_crop - half
-            right_edge = cx_crop + half
-            left_dist  = face_cx - left_edge
-            right_dist = right_edge - face_cx
-            edge_thresh = 0.20 * self.win_w
-            if left_dist < edge_thresh or right_dist < edge_thresh:
-                protect = int(round(min(self.win_w * 1.08, max_win)))
+        # --- Restricciones y Lógica de Composición ---
+        # Asegurar que el zoom no sea ni muy extremo ni muy pequeño
+        max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), self.W)
+        min_win = max(ZOOM_MIN_WIN, OUT_W)
+        self.win_w = np.clip(self.win_w, min_win, max_win)
 
-        target = int(round(np.clip(min(target_by_face, protect), min_win, max_win)))
+        # Asegurar que el cuadro de recorte no se salga de los bordes del frame
+        half_w = self.win_w / 2.0
+        current_win_h = self.win_w / TARGET_ASPECT_RATIO
+        half_h = current_win_h / 2.0
+        
+        min_cx = half_w + EDGE_MARGIN
+        max_cx = self.W - half_w - EDGE_MARGIN
+        self.cx = np.clip(self.cx, min_cx, max_cx)
 
-        new_win = int(round(ZOOM_ALPHA * target + (1 - ZOOM_ALPHA) * self.win_w))
-        if abs(new_win - self.win_w) > ZOOM_MAX_STEP:
-            new_win = self.win_w + np.sign(new_win - self.win_w) * ZOOM_MAX_STEP
+        min_cy = half_h + EDGE_MARGIN
+        max_cy = self.H - half_h - EDGE_MARGIN
+        self.cy = np.clip(self.cy, min_cy, max_cy)
 
-        self.win_w = int(round(np.clip(new_win, min_win, max_win)))
-        return self.win_w
+        return self.cx, self.cy, self.win_w
 
 
 # ============================
 #   CARGA DE TURNOS (speech.json)
 # ============================
 
-def _load_turns(speech_json: str | Path, fps: float) -> List[Tuple[float, float, str]]:
+def _load_turns(speech_json: str | Path, fps: float, highlight_start_sec: float) -> List[Tuple[float, float, str]]:
     """
     Lee speech.json (lista de items con speaker,start,end,text) y devuelve
     una lista de turnos compactados [(start,end,speaker)] fusionando segmentos
@@ -323,8 +288,11 @@ def _load_turns(speech_json: str | Path, fps: float) -> List[Tuple[float, float,
 
     for it in items:
         spk = str(it.get("speaker", "SPEAKER_0"))
-        s   = float(it.get("start", 0.0))
-        e   = float(it.get("end", s))
+        s   = float(it.get("start", 0.0)) - highlight_start_sec # Adjust start time
+        e   = float(it.get("end", s)) - highlight_start_sec   # Adjust end time
+        # Ensure times are not negative after adjustment
+        s = max(0.0, s)
+        e = max(0.0, e)
         if cur_spk is None:
             cur_spk, cur_s, cur_e = spk, s, e
             continue
@@ -339,12 +307,37 @@ def _load_turns(speech_json: str | Path, fps: float) -> List[Tuple[float, float,
 def _find_turn_index(turns: List[Tuple[float,float,str]], tsec: float) -> int:
     """Devuelve el índice del turno activo en tsec (o -1 si no hay)."""
     lo, hi = 0, len(turns)-1
+    tolerance = 0.15 # seconds, to account for small gaps or rounding issues
+
+    best_match_idx = -1
+    min_time_diff = float('inf')
+
     while lo <= hi:
         mid = (lo + hi) // 2
         s, e, _ = turns[mid]
-        if tsec < s: hi = mid - 1
-        elif tsec > e: lo = mid + 1
-        else: return mid
+        
+
+        if s <= tsec <= e:
+            return mid # Direct hit
+
+        # Check if tsec is close to this turn
+        if tsec < s:
+            diff = s - tsec
+            if diff < min_time_diff:
+                min_time_diff = diff
+                best_match_idx = mid
+            hi = mid - 1
+        else: # tsec > e
+            diff = tsec - e
+            if diff < min_time_diff:
+                min_time_diff = diff
+                best_match_idx = mid
+            lo = mid + 1
+    
+    # After binary search, check if the best_match_idx is within tolerance
+    if best_match_idx != -1 and min_time_diff <= tolerance:
+        return best_match_idx
+
     return -1
 
 
@@ -357,6 +350,7 @@ def crop_follow_face_1080x1920_yolo(
     output_path: str,
     speech_json: Optional[str] = None,
     static_per_speaker: bool = False,
+    highlight_start_sec: float = 0.0,
 ):
     """
     - Si static_per_speaker=True y speech_json existe: fija una ventana por turno de hablante con transiciones suaves.
@@ -370,7 +364,7 @@ def crop_follow_face_1080x1920_yolo(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     writer = _open_writer_with_fallback(output_path, fps)
 
-    turns = _load_turns(speech_json, fps) if static_per_speaker and speech_json else []
+    turns = _load_turns(speech_json, fps, highlight_start_sec) if static_per_speaker and speech_json else []
     use_static = static_per_speaker and len(turns) > 0
 
     detector = _pick_detector()
@@ -380,25 +374,25 @@ def crop_follow_face_1080x1920_yolo(
 
     # --- Estado del modo dinámico (fallback) ---
     stabilizer = None
-    zoomer = None
 
     # --- Estado del modo estático por turno ---
     current_turn = -1
     # Valores finales del ancla para el turno actual
     target_anchor_cx: Optional[float] = None
+    target_anchor_cy: Optional[float] = None
     target_anchor_win_w: Optional[int] = None
     # Valores de la rampa de transición
     static_ramp_frames_left = 0
     static_ramp_total_frames = 0
-    start_anchor_cx, start_anchor_win_w = 0.0, 0
+    start_anchor_cx, start_anchor_cy, start_anchor_win_w = 0.0, 0.0, 0
     # Valores a usar en el frame actual (pueden estar en plena rampa)
-    current_cx, current_win_w = 0.0, 0
+    current_cx, current_cy, current_win_w = 0.0, 0.0, 0
 
-    tracker = None
-    tracker_ok = False
     prev_gray = None
     cut_cooldown = 0
     t0 = time.time()
+
+    last_valid_face_anchor = None # Initialize new variable
 
     while True:
         ok, frame = cap.read()
@@ -413,6 +407,7 @@ def crop_follow_face_1080x1920_yolo(
 
         if current_cx == 0.0: # Inicialización en el primer frame
             current_cx, start_anchor_cx, target_anchor_cx = W / 2.0, W / 2.0, W / 2.0
+            current_cy, start_anchor_cy, target_anchor_cy = H / 2.0, H / 2.0, H / 2.0
             current_win_w, start_anchor_win_w, target_anchor_win_w = int(OUT_W * 1.20), int(OUT_W * 1.20), int(OUT_W * 1.20)
 
 
@@ -424,31 +419,11 @@ def crop_follow_face_1080x1920_yolo(
             x, y, w, h = (int(round(c * scale)) for c in (x, y, w, h))
             x, y, w, h = _expand_bbox(x, y, w, h, FACE_SCALE_BOX, W, H)
             last_face = (x, y, w, h)
-            try:
-                tracker = cv2.legacy.TrackerCSRT_create()
-                if tracker is not None:
-                    tracker_ok = tracker.init(frs, tuple(last_face))
-            except AttributeError:
-                tracker = None
-        elif tracker is not None and tracker_ok:
-            tracker_ok, bbox = tracker.update(frs)
-            if tracker_ok:
-                x, y, w, h = map(int, bbox)
-                last_face = _expand_bbox(x, y, w, h, 1.0, W, H)
-                detected = True
 
         tsec = frame_idx / float(fps)
         gray = cv2.cvtColor(frs, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
-            diff = cv2.absdiff(prev_gray, gray)
-            score = float(np.mean(diff))
-            if score > CUT_DIFF_THR and cut_cooldown == 0:
-                if stabilizer is not None:
-                    stabilizer.ramp_frames_left = CUT_RAMP_FRAMES
-                if zoomer is not None:
-                    max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
-                    zoomer.win_w = int(min(zoomer.win_w * 1.15, max_win))
-                cut_cooldown = int(fps * CUT_COOLDOWN_SEC)
+            pass # Cut detection logic removed for now
         prev_gray = gray
         cut_cooldown = max(0, cut_cooldown - 1)
 
@@ -462,6 +437,7 @@ def crop_follow_face_1080x1920_yolo(
                 
                 # --- Iniciar transición a un nuevo ancla ---
                 start_anchor_cx = current_cx
+                start_anchor_cy = current_cy
                 start_anchor_win_w = current_win_w
                 
                 max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
@@ -470,17 +446,24 @@ def crop_follow_face_1080x1920_yolo(
                     if last_face is not None:
                         fx, fy, fw, fh = last_face
                         target_anchor_cx = fx + fw / 2.0
+                        target_anchor_cy = fy + fh / 2.0
                         target_w = int(round(max(fw / max(FACE_TARGET_RATIO, 1e-4), int(OUT_W * 1.15))))
                         target_anchor_win_w = int(np.clip(target_w, OUT_W, max_win))
-                    else: # Si no hay cara, centrar
+                        # Update last_valid_face_anchor
+                        last_valid_face_anchor = (target_anchor_cx, target_anchor_cy, target_anchor_win_w)
+                    elif last_valid_face_anchor is not None:
+                        # If no face detected, but we have a last valid anchor, use it
+                        target_anchor_cx, target_anchor_cy, target_anchor_win_w = last_valid_face_anchor
+                    else: # Fallback to center if no face and no valid anchor
                         target_anchor_cx = W / 2.0
+                        target_anchor_cy = H / 2.0
                         target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
-                else: # Si no hay turno, plano general
+                else: # If no turn, general shot (center)
                     target_anchor_cx = W / 2.0
+                    target_anchor_cy = H / 2.0
                     target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
 
-                # Duración de la rampa (0.5s)
-                static_ramp_total_frames = int(fps * 0.5)
+                
                 static_ramp_frames_left = static_ramp_total_frames
 
             # --- Aplicar rampa de transición si está activa ---
@@ -488,25 +471,55 @@ def crop_follow_face_1080x1920_yolo(
                 t = 1.0 - (static_ramp_frames_left / float(static_ramp_total_frames))
                 t2 = 3*t*t - 2*t*t*t  # Ease-in-out
                 current_cx = (1.0 - t2) * start_anchor_cx + t2 * target_anchor_cx
+                current_cy = (1.0 - t2) * start_anchor_cy + t2 * target_anchor_cy
                 current_win_w = (1.0 - t2) * start_anchor_win_w + t2 * target_anchor_win_w
                 static_ramp_frames_left -= 1
             else:
                 current_cx = target_anchor_cx
+                current_cy = target_anchor_cy
                 current_win_w = target_anchor_win_w
 
             # Aplicar recorte estático (o en transición)
-            half = current_win_w / 2.0
-            left = int(round(current_cx - half))
-            left = max(0, min(W - int(current_win_w), left))
+            # Calcular el tamaño ideal del recorte manteniendo el aspecto 9:16
+            target_crop_width = current_win_w
+            target_crop_height = target_crop_width / TARGET_ASPECT_RATIO
 
-            if last_face is not None:
-                _, fy, _, fh = last_face
-                bias = int(min(OUT_H * 0.06, fh * 0.25))
-            else:
-                bias = int(OUT_H * 0.04)
-            frs_bias = cv2.copyMakeBorder(frs, bias, 0, 0, 0, cv2.BORDER_REFLECT_101)
+            # Ajustar el tamaño del recorte si excede los límites del frame original
+            scale_factor = 1.0
+            if target_crop_width > W:
+                scale_factor = min(scale_factor, W / target_crop_width)
+            if target_crop_height > H:
+                scale_factor = min(scale_factor, H / target_crop_height)
+            
+            crop_width = int(round(target_crop_width * scale_factor))
+            crop_height = int(round(target_crop_height * scale_factor))
 
-            win = frs_bias[:, left:left+int(current_win_w)]
+            # Asegurar que las dimensiones mínimas sean al menos OUT_W y OUT_H (si es posible)
+            # Esto es para evitar que el crop sea demasiado pequeño y se vea pixelado
+            if crop_width < OUT_W:
+                scale_factor = OUT_W / crop_width
+                crop_width = OUT_W
+                crop_height = int(round(crop_height * scale_factor))
+            if crop_height < OUT_H:
+                scale_factor = OUT_H / crop_height
+                crop_height = OUT_H
+                crop_width = int(round(crop_width * scale_factor))
+
+            # Recalcular el centro si las dimensiones se ajustaron
+            # current_cx, current_cy ya están suavizados por la rampa
+
+            # Calcular las coordenadas iniciales del recorte
+            left = int(round(current_cx - crop_width / 2.0))
+            top = int(round(current_cy - crop_height / 2.0))
+
+            # Asegurar que el recorte no se salga de los bordes del frame original
+            left = max(0, min(W - crop_width, left))
+            top = max(0, min(H - crop_height, top))
+            right = left + crop_width
+            bottom = top + crop_height
+
+            win = frs[top:bottom, left:right]
+            
             crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
             crop = np.ascontiguousarray(crop, dtype=np.uint8)
             writer.write(crop)
@@ -515,41 +528,53 @@ def crop_follow_face_1080x1920_yolo(
         # MODO DINÁMICO
         # ------------------
         else:
-            # ... (el modo dinámico no se modifica)
             if stabilizer is None:
-                stabilizer = CinematicStabilizer(W)
-            if zoomer is None:
-                zoomer = ZoomManager(W)
+                stabilizer = OneEuroStabilizer(freq=fps, frame_width=W, frame_height=H)
 
-            if last_face is not None:
-                x, y, w, h = last_face
-                cx_target = x + w/2.0
-                face_for_zoom = last_face
-            else:
-                if stabilizer.miss_count < MISS_HYSTERESIS:
-                    cx_target = stabilizer.cx_smoothed
-                    face_for_zoom = None if last_face is None else last_face
-                else:
-                    cx_target = W / 2.0
-                    face_for_zoom = None
+            # Actualizar el estabilizador y obtener los valores suavizados
+            current_cx, current_cy, current_win_w = stabilizer.update(last_face, tsec)
 
-            cx = stabilizer.update_target(cx_target, detected)
-            lead = np.clip(stabilizer.vx * 1.8, -OUT_W * 0.12, OUT_W * 0.12)
-            cx   = np.clip(cx + lead, OUT_W/2 + EDGE_MARGIN, W - OUT_W/2 - EDGE_MARGIN)
-            face_conf = getattr(detector, "last_conf", 1.0)
-            win_w = zoomer.update(face_for_zoom, cx, face_conf=face_conf, face_vx=stabilizer.vx)
-            half  = win_w / 2.0
-            left = int(round(cx - half))
-            left = max(0, min(W - win_w, left))
+            # Aplicar recorte dinámico
+            # Calcular el tamaño ideal del recorte manteniendo el aspecto 9:16
+            target_crop_width = current_win_w
+            target_crop_height = target_crop_width / TARGET_ASPECT_RATIO
 
-            if last_face is not None:
-                _, fy, _, fh = last_face
-                bias = int(min(OUT_H * 0.06, fh * 0.25))
-            else:
-                bias = int(OUT_H * 0.04)
-            frs_bias = cv2.copyMakeBorder(frs, bias, 0, 0, 0, cv2.BORDER_REFLECT_101)
+            # Ajustar el tamaño del recorte si excede los límites del frame original
+            scale_factor = 1.0
+            if target_crop_width > W:
+                scale_factor = min(scale_factor, W / target_crop_width)
+            if target_crop_height > H:
+                scale_factor = min(scale_factor, H / target_crop_height)
+            
+            crop_width = int(round(target_crop_width * scale_factor))
+            crop_height = int(round(target_crop_height * scale_factor))
 
-            win = frs_bias[:, left:left+win_w]
+            # Asegurar que las dimensiones mínimas sean al menos OUT_W y OUT_H (si es posible)
+            # Esto es para evitar que el crop sea demasiado pequeño y se vea pixelado
+            if crop_width < OUT_W:
+                scale_factor = OUT_W / crop_width
+                crop_width = OUT_W
+                crop_height = int(round(crop_height * scale_factor))
+            if crop_height < OUT_H:
+                scale_factor = OUT_H / crop_height
+                crop_height = OUT_H
+                crop_width = int(round(crop_width * scale_factor))
+
+            # Recalcular el centro si las dimensiones se ajustaron
+            # current_cx, current_cy ya están suavizados por el estabilizador
+
+            # Calcular las coordenadas iniciales del recorte
+            left = int(round(current_cx - crop_width / 2.0))
+            top = int(round(current_cy - crop_height / 2.0))
+
+            # Asegurar que el recorte no se salga de los bordes del frame original
+            left = max(0, min(W - crop_width, left))
+            top = max(0, min(H - crop_height, top))
+            right = left + crop_width
+            bottom = top + crop_height
+
+            win = frs[top:bottom, left:right]
+            
             crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
             crop = np.ascontiguousarray(crop, dtype=np.uint8)
             writer.write(crop)

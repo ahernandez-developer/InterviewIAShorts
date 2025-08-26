@@ -55,6 +55,19 @@ Estas son las decisiones importantes que se tomaron y el porqué. Entenderlas es
     - Se eligió `faster-whisper` por su eficiencia (velocidad y uso de memoria) frente a la implementación original de OpenAI.
     - La activación de `word_timestamps=True` fue la decisión clave que habilitó la creación de subtítulos dinámicos de alta calidad. El `speech.json` resultante es el corazón de la sincronización del proyecto.
 
+5.  **Corrección de la Relación de Aspecto del Recorte (Eliminación de Estiramiento)**
+    - **Problema:** El video final mostraba estiramientos o compresiones visuales, especialmente durante los movimientos de cámara.
+    - **Causa:** La ventana de recorte (`win`) generada por `FaceCropYOLO.py` no siempre mantenía una relación de aspecto 9:16 (vertical) antes de ser redimensionada a la resolución final (1080x1920). Esto causaba distorsión al forzar una imagen con una relación de aspecto incorrecta en un marco 9:16.
+    - **Solución:** Se refactorizó la lógica de recorte en `FaceCropYOLO.py` para asegurar que `crop_width` y `crop_height` siempre se calculen de forma que mantengan estrictamente la relación de aspecto 9:16. Se ajustaron las coordenadas de recorte (`left`, `top`, `right`, `bottom`) y la lógica de recorte para garantizar que la región `win` siempre tenga la proporción correcta antes del redimensionamiento final.
+
+6.  **Seguimiento Robusto del Hablante y Centrado de Cámara**
+    - **Problema:** La cámara a veces apuntaba a "nada" (el centro del encuadre) en lugar de al hablante, especialmente durante los cambios de hablante.
+    - **Causa:** Existía una falta de coincidencia entre la línea de tiempo del `speech.json` (generado para el video completo original) y el `tsec` (tiempo actual en el video recortado). Además, la función `_find_turn_index` era demasiado estricta y devolvía `-1` (no se encontró turno) si `tsec` caía en pequeños huecos entre los turnos de hablante (creados por la compactación de `_load_turns`).
+    - **Solución:**
+        1.  Se modificó `FaceCropYOLO.py` para aceptar `highlight_start_sec` (el inicio del segmento recortado del video original).
+        2.  La función `_load_turns` se actualizó para restar `highlight_start_sec` de todos los timestamps de los turnos, alineando así el `speech.json` con la línea de tiempo del video recortado.
+        3.  La función `_find_turn_index` se hizo más robusta introduciendo una `tolerance` (0.15 segundos) en su búsqueda binaria. Ahora, si `tsec` no cae exactamente dentro de un turno, pero está muy cerca de uno (dentro de la tolerancia), se considera ese turno activo, evitando que la cámara se centre en la nada debido a pequeños huecos.
+
 ---
 
 ## Estado Actual y Próximos Pasos
@@ -63,15 +76,25 @@ El proyecto se encuentra en la **versión 0.1**. Es funcional y estable.
 
 ### Roadmap (Priorizado)
 
-#### Fase 1: Refinamiento y Estabilidad (v0.2)
+#### Fase 1.5: Calidad de Edición Profesional (Prioridad Actual)
 
-En esta fase, nos enfocaremos en mejorar la base del proyecto, la estructura del código y la experiencia de usuario en cuanto a la gestión de archivos.
+*El objetivo de esta fase es asegurar que cada clip generado cumpla con un estándar de calidad profesional, con una duración consistente y una edición visual de alto impacto.*
 
-- [ ] **Refactorización de la Estructura de Código:**
-    - [ ] **Dividir `main.py`:** Extraer la lógica de cada paso del pipeline en funciones o clases dedicadas dentro de sus respectivos módulos en `Components/`. `main.py` debería ser principalmente un orquestador de alto nivel.
-    - [ ] **Consolidar Utilidades:** Revisar `Components/SafeName.py` y las funciones de slug/date prefix en `Components/YoutubeDownloader.py` para crear una única utilidad de nombrado seguro en `Components/common_utils.py` (o similar).
-    - [ ] **Eliminar Código Obsoleto/No Usado:** Remover `Components/Speaker.py` y `Components/SpeakerDetection.py` ya que sus funcionalidades han sido reemplazadas por `FaceCropYOLO.py` y la diarización de `pyannote`.
-    - [ ] **Revisar `Components/Edit.py` y `Components/common_ffmpeg.py`:** Asegurar que las funciones de FFmpeg estén organizadas de la manera más lógica, quizás moviendo `_ffmpeg_path` y `_ensure_parent` a `common_ffmpeg.py` si no están ya allí, y asegurando que `Edit.py` solo contenga funciones de edición de alto nivel.
+- [x] **Consistencia en la Duración del Clip:**
+    - [x] Modificar el prompt y la lógica en `LanguageTasks.py` para instruir al LLM a seleccionar un *highlight* que dure estrictamente **entre 50 y 70 segundos**.
+- [ ] **Edición y Seguimiento de Cámara Profesional:**
+    - [x] **Refinamiento del Seguimiento Facial:** Analizar y ajustar los algoritmos en `FaceCropYOLO.py` para lograr un seguimiento de caras más suave y natural, eliminando movimientos bruscos.
+    - [ ] **Transiciones Cinematográficas:** Mejorar las transiciones entre hablantes. Investigar y aplicar curvas de animación más sofisticadas (e.g., *ease-in-out*) y paneos/zooms más sutiles para un acabado profesional.
+
+#### Fase 1: Refinamiento y Estabilidad (v0.2) - ¡Completada!
+
+En esta fase, nos enfocamos en mejorar la base del proyecto, la estructura del código y la experiencia de usuario en cuanto a la gestión de archivos.
+
+- [x] **Refactorización de la Estructura de Código:**
+    - [x] **Dividir `main.py`:** Extraer la lógica de cada paso del pipeline en funciones o clases dedicadas dentro de sus respectivos módulos en `Components/`. `main.py` debería ser principalmente un orquestador de alto nivel.
+    - [x] **Consolidar Utilidades:** Revisar `Components/SafeName.py` y las funciones de slug/date prefix en `Components/YoutubeDownloader.py` para crear una única utilidad de nombrado seguro en `Components/common_utils.py` (o similar).
+    - [x] **Eliminar Código Obsoleto/No Usado:** Remover `Components/Speaker.py` y `Components/SpeakerDetection.py` ya que sus funcionalidades han sido reemplazadas por `FaceCropYOLO.py` y la diarización de `pyannote`.
+    - [x] **Revisar `Components/Edit.py` y `Components/common_ffmpeg.py`:** Asegurar que las funciones de FFmpeg estén organizadas de la manera más lógica, quizás moviendo `_ffmpeg_path` y `_ensure_parent` a `common_ffmpeg.py` si no están ya allí, y asegurando que `Edit.py` solo contenga funciones de edición de alto nivel.
 
 - [ ] **Gestión de Archivos de Salida:**
     - [ ] **Manejo de Sobrescritura:** Implementar una lógica en `main.py` (o en las funciones de guardado de cada componente) que pregunte al usuario si desea sobrescribir los archivos existentes si se intenta procesar el mismo video nuevamente. Alternativamente, generar un sufijo único (e.g., `_run2`) si el usuario no desea sobrescribir.
@@ -83,7 +106,7 @@ En esta fase, nos enfocaremos en mejorar la base del proyecto, la estructura del
 
 Esta fase se centrará en añadir más "inteligencia" al proceso de edición y permitir una mayor personalización del resultado final.
 
-- [ ] **Mejoras de IA:** Auto-generación de títulos, descripciones y hashtags para los clips.
+- [x] **Mejoras de IA:** Auto-generación de títulos, descripciones y hashtags para los clips.
 - [ ] **Análisis de Contenido Avanzado:** Detección de temática, tono y otros metadatos relevantes del video para una edición más inteligente.
     - [ ] **Detección de Picos Emocionales:** Identificar momentos de alta emoción (risa, sorpresa, enojo, etc.) en audio/video.
     - [ ] **Análisis de Sentimiento del Texto:** Clasificar el tono del segmento (humorístico, serio, etc.).
