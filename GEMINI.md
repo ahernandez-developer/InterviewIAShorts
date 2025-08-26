@@ -82,9 +82,16 @@ El proyecto se encuentra en la **versión 0.1**. Es funcional y estable.
 
 - [x] **Consistencia en la Duración del Clip:**
     - [x] Modificar el prompt y la lógica en `LanguageTasks.py` para instruir al LLM a seleccionar un *highlight* que dure estrictamente **entre 50 y 70 segundos**.
-- [ ] **Edición y Seguimiento de Cámara Profesional:**
-    - [x] **Refinamiento del Seguimiento Facial:** Analizar y ajustar los algoritmos en `FaceCropYOLO.py` para lograr un seguimiento de caras más suave y natural, eliminando movimientos bruscos.
-    - [ ] **Transiciones Cinematográficas:** Mejorar las transiciones entre hablantes. Investigar y aplicar curvas de animación más sofisticadas (e.g., *ease-in-out*) y paneos/zooms más sutiles para un acabado profesional.
+- [ ] **Cámara Virtual Profesional:** Re-diseño del sistema de cámara para lograr un acabado de alta calidad, inspirado en operadores de cámara humanos.
+    - [ ] **Fase 1 (Prioridad Inmediata): Movimiento Orgánico con Simulación Física:**
+        - Implementar un modelo de **muelle-amortiguador (spring-damper)** para las transiciones de cámara (paneo y zoom).
+        - **Objetivo:** Lograr un movimiento natural con aceleración y desaceleración suaves, eliminando la sensación robótica y permitiendo un control fino sobre la "sensación" del movimiento.
+    - [ ] **Fase 2: Composición Inteligente:**
+        - Implementar la **Regla de los Tercios** para posicionar a los hablantes, creando encuadres más dinámicos y visualmente atractivos.
+        - Añadir un sutil efecto de **"respiración" (breathing)** con zoom lento en monólogos largos para evitar tomas estáticas.
+    - [ ] **Fase 3: Ritmo Consciente del Contexto:**
+        - Desarrollar un **paneo anticipatorio** que mueva la cámara lentamente hacia el próximo hablante *antes* de que intervenga.
+        - Implementar una **duración de transición dinámica** que se adapte al ritmo de la conversación (transiciones rápidas para diálogos ágiles, lentas para pausas reflexivas).
 
 #### Fase 1: Refinamiento y Estabilidad (v0.2) - ¡Completada!
 

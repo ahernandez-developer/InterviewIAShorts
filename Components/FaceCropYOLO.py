@@ -39,6 +39,16 @@ EDGE_MARGIN = 48
 ZOOM_MIN_WIN = int(OUT_W * 1.05)
 ZOOM_MAX_WIN_MULT = 1.90
 
+# --- Parámetros de la Cámara de Muelle (Spring Camera) ---
+# Rigidez del muelle (más alto = más rápido reacciona)
+POS_STIFFNESS = 0.08
+# Amortiguación (más alto = menos rebote, >1 puede ser sobre-amortiguado)
+POS_DAMPING = 0.60
+# Rigidez del muelle para el zoom
+ZOOM_STIFFNESS = 0.05
+# Amortiguación para el zoom
+ZOOM_DAMPING = 0.75
+
 # Anti-cut (detección de cambio de plano)
 CUT_DIFF_THR = 18.0
 CUT_COOLDOWN_SEC = 0.5
@@ -254,6 +264,43 @@ class OneEuroStabilizer:
         return self.cx, self.cy, self.win_w
 
 
+class CameraSpring:
+    """
+    Simula un sistema de muelle-amortiguador para un movimiento suave y orgánico.
+    Cada instancia de esta clase maneja un único valor (e.g., x, y, o zoom).
+    """
+    def __init__(self, stiffness: float = 0.1, damping: float = 0.5):
+        self.stiffness = stiffness
+        self.damping = damping
+        self.pos = 0.0
+        self.vel = 0.0
+
+    def reset_to(self, target: float):
+        """Resetea instantáneamente la posición y velocidad del muelle."""
+        self.pos = target
+        self.vel = 0.0
+
+    def update(self, target: float, dt: float = 1.0) -> float:
+        """
+        Actualiza el estado del muelle y devuelve la nueva posición.
+        dt (delta time) es un factor de escala. Para sistemas basados en frames, 1.0 es un buen default.
+        """
+        # Calcular la fuerza del muelle (ley de Hooke)
+        spring_force = (target - self.pos) * self.stiffness
+        
+        # Calcular la fuerza de amortiguación
+        damping_force = -self.vel * self.damping
+        
+        # Calcular la aceleración total
+        acceleration = (spring_force + damping_force) * dt
+        
+        # Actualizar velocidad y posición
+        self.vel += acceleration
+        self.pos += self.vel * dt
+        
+        return self.pos
+
+
 # ============================
 #   CARGA DE TURNOS (speech.json)
 # ============================
@@ -375,18 +422,14 @@ def crop_follow_face_1080x1920_yolo(
     # --- Estado del modo dinámico (fallback) ---
     stabilizer = None
 
-    # --- Estado del modo estático por turno ---
+    # --- Estado de la Cámara de Muelle (Modo Estático) ---
+    cam_x = CameraSpring(stiffness=POS_STIFFNESS, damping=POS_DAMPING)
+    cam_y = CameraSpring(stiffness=POS_STIFFNESS, damping=POS_DAMPING)
+    cam_zoom = CameraSpring(stiffness=ZOOM_STIFFNESS, damping=ZOOM_DAMPING)
     current_turn = -1
-    # Valores finales del ancla para el turno actual
     target_anchor_cx: Optional[float] = None
     target_anchor_cy: Optional[float] = None
     target_anchor_win_w: Optional[int] = None
-    # Valores de la rampa de transición
-    static_ramp_frames_left = 0
-    static_ramp_total_frames = 0
-    start_anchor_cx, start_anchor_cy, start_anchor_win_w = 0.0, 0.0, 0
-    # Valores a usar en el frame actual (pueden estar en plena rampa)
-    current_cx, current_cy, current_win_w = 0.0, 0.0, 0
 
     prev_gray = None
     cut_cooldown = 0
@@ -405,10 +448,13 @@ def crop_follow_face_1080x1920_yolo(
 
         frs, W, H, scale = _resize_to_h(frame)
 
-        if current_cx == 0.0: # Inicialización en el primer frame
-            current_cx, start_anchor_cx, target_anchor_cx = W / 2.0, W / 2.0, W / 2.0
-            current_cy, start_anchor_cy, target_anchor_cy = H / 2.0, H / 2.0, H / 2.0
-            current_win_w, start_anchor_win_w, target_anchor_win_w = int(OUT_W * 1.20), int(OUT_W * 1.20), int(OUT_W * 1.20)
+        if frame_idx == 1: # Inicialización en el primer frame
+            initial_cx, initial_cy = W / 2.0, H / 2.0
+            initial_win_w = int(OUT_W * 1.20)
+            cam_x.reset_to(initial_cx)
+            cam_y.reset_to(initial_cy)
+            cam_zoom.reset_to(initial_win_w)
+            target_anchor_cx, target_anchor_cy, target_anchor_win_w = initial_cx, initial_cy, initial_win_w
 
 
         face = detector.detect(frame)
@@ -435,11 +481,6 @@ def crop_follow_face_1080x1920_yolo(
             if idx != current_turn:
                 current_turn = idx
                 
-                # --- Iniciar transición a un nuevo ancla ---
-                start_anchor_cx = current_cx
-                start_anchor_cy = current_cy
-                start_anchor_win_w = current_win_w
-                
                 max_win = min(int(OUT_W * ZOOM_MAX_WIN_MULT), W)
                 
                 if current_turn >= 0:
@@ -449,35 +490,22 @@ def crop_follow_face_1080x1920_yolo(
                         target_anchor_cy = fy + fh / 2.0
                         target_w = int(round(max(fw / max(FACE_TARGET_RATIO, 1e-4), int(OUT_W * 1.15))))
                         target_anchor_win_w = int(np.clip(target_w, OUT_W, max_win))
-                        # Update last_valid_face_anchor
                         last_valid_face_anchor = (target_anchor_cx, target_anchor_cy, target_anchor_win_w)
                     elif last_valid_face_anchor is not None:
-                        # If no face detected, but we have a last valid anchor, use it
                         target_anchor_cx, target_anchor_cy, target_anchor_win_w = last_valid_face_anchor
-                    else: # Fallback to center if no face and no valid anchor
+                    else: # Fallback to center
                         target_anchor_cx = W / 2.0
                         target_anchor_cy = H / 2.0
                         target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
-                else: # If no turn, general shot (center)
+                else: # Si no hay turno, plano general (centro)
                     target_anchor_cx = W / 2.0
                     target_anchor_cy = H / 2.0
                     target_anchor_win_w = int(np.clip(int(OUT_W * 1.20), OUT_W, max_win))
 
-                
-                static_ramp_frames_left = static_ramp_total_frames
-
-            # --- Aplicar rampa de transición si está activa ---
-            if static_ramp_frames_left > 0:
-                t = 1.0 - (static_ramp_frames_left / float(static_ramp_total_frames))
-                t2 = 3*t*t - 2*t*t*t  # Ease-in-out
-                current_cx = (1.0 - t2) * start_anchor_cx + t2 * target_anchor_cx
-                current_cy = (1.0 - t2) * start_anchor_cy + t2 * target_anchor_cy
-                current_win_w = (1.0 - t2) * start_anchor_win_w + t2 * target_anchor_win_w
-                static_ramp_frames_left -= 1
-            else:
-                current_cx = target_anchor_cx
-                current_cy = target_anchor_cy
-                current_win_w = target_anchor_win_w
+            # --- Actualizar la cámara de muelle en cada frame ---
+            current_cx = cam_x.update(target_anchor_cx)
+            current_cy = cam_y.update(target_anchor_cy)
+            current_win_w = cam_zoom.update(target_anchor_win_w)
 
             # Aplicar recorte estático (o en transición)
             # Calcular el tamaño ideal del recorte manteniendo el aspecto 9:16

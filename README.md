@@ -90,11 +90,16 @@ El desarrollo del "Generador de Shorts Virales con IA" sigue un enfoque iterativ
 
 - [x] **Consistencia en la Duración del Clip:**
     - [x] Modificar el prompt y la lógica en `LanguageTasks.py` para instruir al LLM a seleccionar un *highlight* que dure estrictamente **entre 50 y 70 segundos**.
-- [x] **Edición y Seguimiento de Cámara Profesional:**
-    - [x] **Refinamiento del Seguimiento Facial:** Se implementaron mejoras significativas en `FaceCropYOLO.py` para asegurar un seguimiento de caras más suave y natural. Esto incluyó:
-        -   **Corrección de la Relación de Aspecto:** Eliminación de estiramientos visuales al garantizar que la ventana de recorte siempre mantenga una relación de aspecto 9:16.
-        -   **Seguimiento Robusto del Hablante:** Mejora del centrado de la cámara y reducción de momentos en los que apunta a "nada", mediante la alineación de los timestamps de `speech.json` con el video recortado y una lógica de búsqueda de turnos más tolerante.
-    - [ ] **Transiciones Cinematográficas:** Mejorar las transiciones entre hablantes. Investigar y aplicar curvas de animación más sofisticadas (e.g., *ease-in-out*) y paneos/zooms más sutiles para un acabado profesional.
+- [ ] **Cámara Virtual Profesional:** Re-diseño del sistema de cámara para lograr un acabado de alta calidad, inspirado en operadores de cámara humanos.
+    - [ ] **Fase 1 (Prioridad Inmediata): Movimiento Orgánico con Simulación Física:**
+        - Implementar un modelo de **muelle-amortiguador (spring-damper)** para las transiciones de cámara (paneo y zoom).
+        - **Objetivo:** Lograr un movimiento natural con aceleración y desaceleración suaves, eliminando la sensación robótica y permitiendo un control fino sobre la "sensación" del movimiento.
+    - [ ] **Fase 2: Composición Inteligente:**
+        - Implementar la **Regla de los Tercios** para posicionar a los hablantes, creando encuadres más dinámicos y visualmente atractivos.
+        - Añadir un sutil efecto de **"respiración" (breathing)** con zoom lento en monólogos largos para evitar tomas estáticas.
+    - [ ] **Fase 3: Ritmo Consciente del Contexto:**
+        - Desarrollar un **paneo anticipatorio** que mueva la cámara lentamente hacia el próximo hablante *antes* de que intervenga.
+        - Implementar una **duración de transición dinámica** que se adapte al ritmo de la conversación (transiciones rápidas para diálogos ágiles, lentas para pausas reflexivas).
 
 #### Fase 1: Refinamiento y Estabilidad (v0.2) - ¡Completada!
 
