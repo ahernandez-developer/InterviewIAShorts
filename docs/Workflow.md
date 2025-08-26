@@ -2,7 +2,7 @@
 
 ## Introducción
 
-El objetivo de este proyecto es convertir un video largo (ej. una entrevista de YouTube) en un videoclip corto, vertical (9:16), con subtítulos dinámicos y un encuadre profesional, listo para ser publicado en plataformas como Shorts, TikTok o Reels. El siguiente documento detalla el pipeline técnico paso a paso, desde la URL inicial hasta el video final.
+El objetivo de este proyecto es convertir un video largo (ej. una entrevista de YouTube) en un videoclip corto, vertical (9:16), con subtítulos dinámicos y un encuadre profesional, listo para ser publicado en plataformas como Shorts, TikTok o Reels. El script `main.py` actúa como el punto de entrada principal, orquestando el flujo de trabajo a través de `pipeline.py`. El siguiente documento detalla el pipeline técnico paso a paso, desde la URL inicial hasta el video final.
 
 ## Diagrama de Flujo
 

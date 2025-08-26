@@ -152,6 +152,27 @@ La fase final se enfocará en la automatización completa del flujo de trabajo y
 
 ---
 
+## Lecciones Aprendidas y Metodología de Debugging
+
+Durante el desarrollo de la v0.1 y las mejoras de la Fase 1.5, se consolidó una metodología de debugging iterativa que resultó crucial para resolver problemas complejos de procesamiento de video. Para futuros agentes, es vital comprender y aplicar este enfoque:
+
+1.  **Diagnóstico Basado en Observación:** Siempre iniciar con una descripción clara y detallada del problema visual o funcional reportado por el usuario.
+2.  **Hipótesis y Localización del Problema:** Formular hipótesis sobre la causa raíz y usar el conocimiento de la arquitectura del pipeline (`docs/Workflow.md`) para identificar el componente o la sección de código más probable.
+3.  **Instrumentación con Debugging:** Insertar `logging.info` o `logging.debug` estratégicamente para exponer variables clave, flujos de ejecución y estados intermedios. Esto es fundamental para transformar una observación visual en datos concretos.
+    *   **Ejemplo:** Para el problema de "estiramiento", se imprimió la relación de aspecto de la ventana de recorte (`win.shape[1] / win.shape[0]`) para confirmar que no era 9:16.
+    *   **Ejemplo:** Para el problema de "cámara a la nada", se imprimieron `tsec`, `last_face`, `target_anchor` y los detalles de la búsqueda de turnos (`DEBUG_TURN_FINDER`) para identificar el desajuste de timestamps y los huecos.
+4.  **Análisis de Datos de Debugging:** Interpretar la salida de debugging para validar o refutar la hipótesis inicial y refinar la comprensión del problema.
+5.  **Propuesta de Solución y Justificación:** Basado en el análisis, proponer una solución concreta y explicar *por qué* se espera que resuelva el problema, haciendo referencia a los datos de debugging.
+6.  **Implementación Iterativa:** Aplicar los cambios de código de forma incremental, verificando cada paso.
+7.  **Verificación y Feedback:** Ejecutar el pipeline y obtener feedback del usuario sobre la resolución del problema. Si persiste, volver al paso 1 con una hipótesis refinada.
+8.  **Limpieza:** Una vez resuelto el problema, eliminar todos los prints de debugging y las importaciones temporales para mantener el código limpio y eficiente.
+
+**Importancia de la Sincronización de Timestamps:** Un aprendizaje clave fue la criticidad de la sincronización de timestamps entre diferentes etapas del pipeline (video original, video recortado, `speech.json`). Cualquier desalineación, por pequeña que sea, puede tener efectos cascada en la precisión del seguimiento y la generación de subtítulos.
+
+**Robustez ante Datos Imperfectos:** La necesidad de hacer que la lógica de búsqueda de turnos (`_find_turn_index`) fuera tolerante a pequeños huecos en los datos de `speech.json` (debido a la compactación de turnos) subraya la importancia de construir algoritmos robustos que puedan manejar las imperfecciones inherentes a los datos del mundo real.
+
+---
+
 ## Cómo Ejecutar
 
 El script es interactivo.
