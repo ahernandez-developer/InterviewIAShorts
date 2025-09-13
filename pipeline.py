@@ -15,7 +15,7 @@ from Components.common_utils import create_safe_filename
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
 from Components.LanguageTasks import get_highlight, generate_video_metadata
-from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo, mux_audio_video_nvenc
+from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo, mux_audio_video
 from Components.Subtitles import generate_ass, burn_in_subtitles
 
 load_dotenv()
@@ -88,7 +88,7 @@ class VideoProcessingPipeline:
                 transcriptions = transcribeAudio(
                     str(wav_path),
                     model_size="medium",
-                    language="es",
+                    language=None,
                     beam_size=1,
                     vad_filter=True,
                     diarization="auto",
@@ -154,15 +154,14 @@ class VideoProcessingPipeline:
                 )
             self.console.print(f"✅ Clip recortado con cámara virtual: [green]{cropped_path}[/green]")
 
-            self.hr("Muxing Final (NVENC)")
+            self.hr("Muxing Final")
             final_short = odir / "Final.mp4"
             with self.console.status("[bold yellow]Fusionando video y audio...[/bold yellow]", spinner="dots"):
-                mux_audio_video_nvenc(
+                mux_audio_video(
                     video_with_audio=str(cut_path),
                     video_without_audio=str(cropped_path),
                     dst=str(final_short),
-                    fps=30,
-                    v_bitrate="6M"
+                    fps=30
                 )
             self.console.print(f"✅ Short (sin subtítulos) listo en: [green]{final_short}[/green]")
 

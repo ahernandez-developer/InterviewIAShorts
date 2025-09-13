@@ -8,10 +8,12 @@ pytubefix
 torch==2.4.*      # cu124 (instálalo con el index-url de PyTorch CUDA)
 torchvision==0.19.*
 torchaudio==2.4.*
-openai==1.44.1
+google-generativeai>=0.5.0
 rich>=13.0.0
 ultralytics>=8.0.0 # Added for YOLO
 pyannote.audio>=3.0.0 # Added for diarization (optional)
 # Removed: ffmpeg, ffmpeg-python, moviepy, webrtcvad-wheels, pydub (not directly imported/used as Python packages)
 --extra-index-url https://download.pytorch.org/whl/cu121
-OneEuroFilter==1.0.1 
+OneEuroFilter==0.2.1 
+psutil>=5.9.0
+nvidia-ml-py>=11.450.51

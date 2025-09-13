@@ -1,4 +1,4 @@
-import openai
+import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 import json
@@ -7,33 +7,37 @@ from typing import Dict, Any, Tuple
 
 load_dotenv()
 
-# Configure OpenAI client
-openai.api_key = os.getenv("OPENAI_API")
-if not openai.api_key:
-    raise ValueError("OPENAI_API not found in .env file.")
+# Configure Gemini client
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if not gemini_api_key:
+    raise ValueError("GEMINI_API_KEY not found in .env file.")
+genai.configure(api_key=gemini_api_key)
 
 logger = logging.getLogger("rich")
 
-def _call_openai_api(system_prompt: str, user_prompt: str, model: str = "gpt-4o-2024-05-13") -> Dict[str, Any] | None:
+def _call_gemini_api(system_prompt: str, user_prompt: str, model: str = "gemini-1.5-flash") -> Dict[str, Any] | None:
     """
-    Helper function to call the OpenAI ChatCompletion API and parse the JSON response.
+    Helper function to call the Gemini API and parse the JSON response.
     """
     try:
-        response = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.7,
-        )
-        content = response.choices[0].message.content
+        model = genai.GenerativeModel(model)
+        # The Gemini API doesn't have a dedicated JSON mode parameter. 
+        # The instruction to return JSON must be part of the prompt.
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        response = model.generate_content(full_prompt)
+        
+        # Clean the response to extract only the JSON part.
+        # Gemini can sometimes add ```json ... ``` markers.
+        content = response.text
+        if content.strip().startswith("```json"):
+            content = content.strip()[7:-3].strip()
+            
         return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON from OpenAI response: {e}\nResponse content: {content}")
+        logger.error(f"Error decoding JSON from Gemini response: {e}\nResponse content: {content}")
     except Exception as e:
-        logger.error(f"An unexpected error occurred in _call_openai_api: {e}")
+        logger.error(f"An unexpected error occurred in _call_gemini_api: {e}")
     return None
 
 def get_highlight(transcription: str, min_duration: float = 50, max_duration: float = 70, max_retries: int = 3) -> Tuple[float, float]:
@@ -65,7 +69,7 @@ def get_highlight(transcription: str, min_duration: float = 50, max_duration: fl
     
     for attempt in range(max_retries):
         logger.info(f"Requesting highlight from LLM (Attempt {attempt + 1}/{max_retries})...")
-        json_response = _call_openai_api(system_prompt, transcription)
+        json_response = _call_gemini_api(system_prompt, transcription)
 
         if json_response and isinstance(json_response, dict):
             start = json_response.get("start_time")
@@ -113,7 +117,7 @@ def generate_video_metadata(highlight_text: str) -> Dict[str, Any]:
     """
     
     logger.info("Requesting video metadata from LLM...")
-    json_response = _call_openai_api(system_prompt, highlight_text)
+    json_response = _call_gemini_api(system_prompt, highlight_text)
 
     if json_response and isinstance(json_response, dict):
         # Basic validation

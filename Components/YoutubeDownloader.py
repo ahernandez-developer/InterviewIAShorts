@@ -92,7 +92,7 @@ def _ffmpeg_merge(video_path: Path, audio_path: Path, out_path: Path, try_copy: 
         "-i", str(video_path),
         "-i", str(audio_path),
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "h264_nvenc", "-preset", "p5",
+        "-c:v", "h264_nvenc", "-preset", "p7",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k",
         "-movflags", "+faststart",
