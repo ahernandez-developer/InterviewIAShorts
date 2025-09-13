@@ -1,13 +1,31 @@
-import google.generativeai as genai
-from dotenv import load_dotenv
+# Components/LanguageTasks.py
 import os
 import json
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, List, Type
+import bisect
+
+import google.generativeai as genai
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
-# Configure Gemini client
+# --- Pydantic Schemas ---
+class Highlight(BaseModel):
+    start_time: float = Field(description="The start time in seconds of a potential highlight.")
+    end_time: float = Field(description="The end time in seconds of a potential highlight.")
+    highlight_reason: str = Field(description="A brief explanation of why this segment is engaging.")
+
+class HighlightListResponse(BaseModel):
+    highlights: List[Highlight] = Field(description="A list of the most engaging highlights found in the text.")
+
+class MetadataResponse(BaseModel):
+    title: str = Field(description="A short, catchy, and viral-worthy title for the video clip.")
+    description: str = Field(description="A slightly longer, engaging description for the video.")
+    hashtags: List[str] = Field(description="A list of relevant hashtags.")
+
+# --- Gemini Configuration ---
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
     raise ValueError("GEMINI_API_KEY not found in .env file.")
@@ -15,112 +33,130 @@ genai.configure(api_key=gemini_api_key)
 
 logger = logging.getLogger("rich")
 
-def _call_gemini_api(system_prompt: str, user_prompt: str, model: str = "gemini-1.5-flash") -> Dict[str, Any] | None:
-    """
-    Helper function to call the Gemini API and parse the JSON response.
-    """
+# --- Helper Functions ---
+def _call_gemini_api(prompt: str, response_schema: Type[BaseModel], model_name: str = "gemini-1.5-flash") -> Dict[str, Any] | None:
     try:
-        model = genai.GenerativeModel(model)
-        # The Gemini API doesn't have a dedicated JSON mode parameter. 
-        # The instruction to return JSON must be part of the prompt.
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        
-        response = model.generate_content(full_prompt)
-        
-        # Clean the response to extract only the JSON part.
-        # Gemini can sometimes add ```json ... ``` markers.
-        content = response.text
-        if content.strip().startswith("```json"):
-            content = content.strip()[7:-3].strip()
-            
-        return json.loads(content)
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON from Gemini response: {e}\nResponse content: {content}")
+        model = genai.GenerativeModel(
+            model_name,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            )
+        )
+        response = model.generate_content(prompt)
+        return json.loads(response.text)
     except Exception as e:
         logger.error(f"An unexpected error occurred in _call_gemini_api: {e}")
+        return None
+
+def _adjust_highlight_duration(
+    highlight: Dict[str, Any],
+    all_words: List[Dict[str, Any]],
+    min_duration: float,
+    max_duration: float
+) -> Dict[str, Any] | None:
+    """
+    Adjusts the start and end times of a highlight to fit the duration constraints.
+    """
+    if not all_words:
+        return None
+
+    word_starts = [word['start'] for word in all_words]
+    start_index = bisect.bisect_left(word_starts, highlight['start_time'])
+    end_index = bisect.bisect_left(word_starts, highlight['end_time'])
+    
+    start_index = max(0, min(start_index, len(all_words) - 1))
+    end_index = max(0, min(end_index, len(all_words) - 1))
+
+    if start_index >= end_index:
+        end_index = start_index
+
+    center_index = (start_index + end_index) // 2
+    start_index = end_index = center_index
+
+    while end_index < len(all_words) - 1 and start_index > 0:
+        current_duration = all_words[end_index]['end'] - all_words[start_index]['start']
+        if current_duration >= min_duration:
+            break
+        
+        if start_index > 0:
+            start_index -= 1
+        if end_index < len(all_words) - 1:
+            end_index += 1
+    
+    while (all_words[end_index]['end'] - all_words[start_index]['start']) > max_duration and end_index > start_index:
+        end_index -= 1
+
+    final_duration = all_words[end_index]['end'] - all_words[start_index]['start']
+
+    if min_duration <= final_duration <= max_duration:
+        logger.info(f"Adjusted highlight to {final_duration:.2f}s duration.")
+        return {
+            "start": all_words[start_index]['start'],
+            "end": all_words[end_index]['end'],
+            "reason": highlight.get('highlight_reason', 'N/A')
+        }
+    
+    logger.warning(f"Could not adjust highlight to fit duration constraints. Final duration: {final_duration:.2f}s")
     return None
 
-def get_highlight(transcription: str, min_duration: float = 50, max_duration: float = 70, max_retries: int = 3) -> Tuple[float, float]:
+# --- Main Functions ---
+def get_highlights(transcriptions: List[Dict[str, Any]], min_duration: float = 50, max_duration: float = 70, max_retries: int = 3) -> List[Dict[str, Any]]:
     """
-    Identifies the most viral highlight from a transcription using an LLM,
-    ensuring the duration is within a specified range.
-    Returns the start and end times in seconds.
+    Identifies top highlights using an LLM, then programmatically adjusts their duration.
     """
-    system_prompt = f"""
-    You are an expert social media video editor. The user will provide a transcription where each
-    line is prefixed with its start and end times in seconds (e.g., '0.00 - 5.21: text...').
-    
-    Your task is to find the most interesting, engaging, or viral-worthy continuous segment.
-    
-    IMPORTANT CONSTRAINTS:
-    1. The duration of the selected segment MUST be strictly between {min_duration} and {max_duration} seconds.
-    2. To calculate the duration, subtract the start time of your first chosen line from the end time of your last chosen line.
-    3. The lines you choose must be continuous (a solid block of text from the transcription).
-    
-    Analyze the text and its timestamps, then return a JSON object with the precise start and end times of your selected block.
-    
-    The JSON output must follow this exact format:
-    {{
-      "start_time": <float>,  // The start time of the very first line you selected.
-      "end_time": <float>,    // The end time of the very last line you selected.
-      "highlight_reason": "<briefly explain why you chose this segment>"
-    }}
+    system_prompt = """
+    You are an expert social media video editor. The user will provide a transcription.
+    Your task is to find up to 3 of the most interesting, engaging, or viral-worthy moments.
+    Focus on the content and ignore duration. Provide a reason for each choice.
     """
     
-    for attempt in range(max_retries):
-        logger.info(f"Requesting highlight from LLM (Attempt {attempt + 1}/{max_retries})...")
-        json_response = _call_gemini_api(system_prompt, transcription)
+    user_prompt_text = ""
+    for seg in transcriptions:
+        user_prompt_text += f"{seg['start']:.2f} - {seg['end']:.2f}: {seg['text']}\n"
 
-        if json_response and isinstance(json_response, dict):
-            start = json_response.get("start_time")
-            end = json_response.get("end_time")
-            if isinstance(start, (int, float)) and isinstance(end, (int, float)) and start < end:
-                duration = end - start
-                if min_duration <= duration <= max_duration:
-                    logger.info(f"Highlight selected by LLM: {start:.2f}s to {end:.2f}s (Duration: {duration:.2f}s). Reason: {json_response.get('highlight_reason', 'N/A')}")
-                    return float(start), float(end)
-                else:
-                    logger.warning(f"LLM returned a clip with invalid duration ({duration:.2f}s). Retrying...")
+    all_words = [word for seg in transcriptions for word in seg.get('words', [])]
+    if not all_words:
+        logger.error("Transcription contains no word-level timestamps. Cannot adjust highlights.")
+        return []
+
+    for attempt in range(max_retries):
+        logger.info(f"Requesting candidate highlights from LLM (Attempt {attempt + 1}/{max_retries})...")
+        
+        full_prompt = f"{system_prompt}\n\n{user_prompt_text}"
+        json_response = _call_gemini_api(full_prompt, response_schema=HighlightListResponse)
+
+        if json_response and isinstance(json_response, dict) and "highlights" in json_response:
+            adjusted_highlights = []
+            for highlight in json_response["highlights"]:
+                adjusted = _adjust_highlight_duration(highlight, all_words, min_duration, max_duration)
+                if adjusted:
+                    adjusted_highlights.append(adjusted)
+            
+            if adjusted_highlights:
+                logger.info(f"Successfully processed and adjusted {len(adjusted_highlights)} highlights.")
+                return adjusted_highlights
             else:
-                logger.warning("LLM returned invalid start/end times. Retrying...")
+                logger.warning("LLM gave candidates, but none could be adjusted to the required duration. Retrying...")
         else:
             logger.warning("LLM call failed or returned invalid format. Retrying...")
 
-    logger.error(f"Failed to get a valid highlight from the LLM after {max_retries} attempts. Returning default 0-60s.")
-    # As a fallback, find the first 60-second chunk.
-    # This is a simple fallback, could be improved.
-    first_segment_start = 0.0
-    try:
-        # A bit of a hack to find the start of the first sentence in the transcription
-        first_segment_start = float(transcription.strip().split(' ')[0])
-    except (ValueError, IndexError):
-        pass # Keep 0.0 if parsing fails
-    return first_segment_start, first_segment_start + 60.0
+    logger.error(f"Failed to get and adjust any valid highlights after {max_retries} attempts.")
+    return []
 
 def generate_video_metadata(highlight_text: str) -> Dict[str, Any]:
     """
     Generates a viral title, description, and hashtags for a video clip using an LLM.
     """
     system_prompt = """
-    You are a social media marketing expert specializing in creating viral content for platforms
-    like TikTok, YouTube Shorts, and Instagram Reels.
-    
-    Based on the provided text from a video clip, generate a compelling and SEO-friendly
-    title, a short engaging description, and a list of relevant hashtags.
-    
-    The output must be a JSON object with the following structure:
-    {
-      "title": "<short, catchy, and viral-worthy title>",
-      "description": "<a slightly longer, engaging description for the video>",
-      "hashtags": ["#hashtag1", "#hashtag2", "#hashtag3"]
-    }
+    You are a social media marketing expert. Based on the provided text from a video clip,
+    generate a compelling title, a short description, and relevant hashtags.
     """
     
     logger.info("Requesting video metadata from LLM...")
-    json_response = _call_gemini_api(system_prompt, highlight_text)
+    json_response = _call_gemini_api(system_prompt + "\n\n" + highlight_text, response_schema=MetadataResponse)
 
     if json_response and isinstance(json_response, dict):
-        # Basic validation
         if "title" in json_response and "description" in json_response and "hashtags" in json_response:
             logger.info("Successfully generated video metadata.")
             return json_response
@@ -131,20 +167,3 @@ def generate_video_metadata(highlight_text: str) -> Dict[str, Any]:
         "description": "",
         "hashtags": ["#viral", "#clip"]
     }
-
-if __name__ == '__main__':
-    # Example usage for testing
-    # Create a long dummy transcription for testing duration constraints
-    dummy_transcription = ""
-    for i in range(120):
-        dummy_transcription += f"{i}.0 - {i+1}.0: This is sentence number {i}. \n"
-
-    print("--- Testing GetHighlight ---")
-    start_time, end_time = get_highlight(dummy_transcription)
-    print(f"Highlight: {start_time:.2f}s - {end_time:.2f}s")
-    print(f"Duration: {end_time - start_time:.2f}s")
-
-    print("\n--- Testing Generate Video Metadata ---")
-    metadata = generate_video_metadata("We discuss the importance of AI in modern software development.")
-    print("Generated Metadata:")
-    print(json.dumps(metadata, indent=2))

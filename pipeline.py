@@ -14,9 +14,11 @@ from Components.YoutubeDownloader import get_video_streams, download_and_merge
 from Components.common_utils import create_safe_filename
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
 from Components.Transcription import transcribeAudio
-from Components.LanguageTasks import get_highlight, generate_video_metadata
+from Components.LanguageTasks import get_highlights, generate_video_metadata
 from Components.FaceCropYOLO import crop_follow_face_1080x1920_yolo, mux_audio_video
 from Components.Subtitles import generate_ass, burn_in_subtitles
+from Components.ContentClassifier import classify_video_content
+import shutil
 
 load_dotenv()
 
@@ -33,9 +35,9 @@ class VideoProcessingPipeline:
     def run(self):
         """Executes the entire video processing pipeline."""
         try:
+            # --- 1. Setup and Download (runs once) ---
             self.hr("Descarga de Video")
             url = self.console.input("[bold green]Introduce la URL del video de YouTube:[/bold green] ").strip()
-            
             yt, video_streams = get_video_streams(url)
             
             self.console.print("[bold]Available video streams:[/bold]")
@@ -65,129 +67,132 @@ class VideoProcessingPipeline:
                 return
 
             final_mp4 = Path(final_path_str)
-            wdir, odir = self.make_project_dirs(final_mp4)
+            wdir, main_odir = self.make_project_dirs(final_mp4)
             self.console.print(f"✅ Video descargado en: [green]{final_mp4}[/green]")
             self.logger.info(f"Directorio de trabajo: [cyan]{wdir}[/cyan]")
-            self.logger.info(f"Directorio de salida: [cyan]{odir}[/cyan]")
+            self.logger.info(f"Directorio de salida principal: [cyan]{main_odir}[/cyan]")
 
-            self.hr("Extracción de Audio")
-            with self.console.status("[bold yellow]Extrayendo audio a WAV...[/bold yellow]", spinner="dots"):
-                companion_audio = self.guess_companion_audio(final_mp4)
-                audio_src = companion_audio if companion_audio else final_mp4
-                wav_path = wdir / "audio.wav"
-                extract_audio_wav(src=str(audio_src), wav=str(wav_path))
+            # --- 2. Analysis (runs once) ---
+            self.hr("Análisis de Contenido")
             
+            # Audio Extraction
+            wav_path = wdir / "audio.wav"
             if not wav_path.exists():
-                self.logger.error("[bold red]No se encontró el archivo de audio para la transcripción.[/bold red]")
-                return
-            self.console.print(f"✅ Audio extraído a: [green]{wav_path}[/green]")
+                with self.console.status("[bold yellow]Extrayendo audio a WAV...[/bold yellow]", spinner="dots"):
+                    extract_audio_wav(src=str(final_mp4), wav=str(wav_path))
+                self.console.print("✅ Audio extraído.")
+            else:
+                self.console.print("✅ Audio ya extraído.")
 
-            self.hr("Transcripción (ASR) con Word Timestamps")
+            # Transcription
             speech_json_path = wdir / "speech.json"
-            with self.console.status("[bold yellow]Transcribiendo audio (esto puede tardar)...[/bold yellow]", spinner="dots"):
-                transcriptions = transcribeAudio(
-                    str(wav_path),
-                    model_size="medium",
-                    language=None,
-                    beam_size=1,
-                    vad_filter=True,
-                    diarization="auto",
-                    write_speech_json_to=str(speech_json_path),
-                )
-            
+            if not speech_json_path.exists():
+                with self.console.status("[bold yellow]Transcribiendo audio...[/bold yellow]", spinner="dots"):
+                    transcriptions = transcribeAudio(
+                        str(wav_path), model_size="medium", language=None, beam_size=1,
+                        vad_filter=True, diarization="auto", write_speech_json_to=str(speech_json_path),
+                    )
+                self.console.print("✅ Transcripción completada.")
+            else:
+                with open(speech_json_path, "r", encoding="utf-8") as f:
+                    transcriptions = json.load(f)
+                self.console.print("✅ Transcripción cargada desde archivo.")
+
             if not transcriptions:
                 self.logger.error("[bold red]La transcripción no devolvió resultados.[/bold red]")
                 return
-            self.console.print(f"✅ Transcripción completada y guardada en: [green]{speech_json_path}[/green]")
 
-            self.hr("Selección de Highlight (LLM)")
-            with self.console.status("[bold yellow]Seleccionando el highlight con IA...[/bold yellow]", spinner="dots"):
-                trans_text = self.build_transcript_string(transcriptions)
-                start_sec, end_sec = get_highlight(trans_text)
+            # Content Classification
+            with self.console.status("[bold yellow]Clasificando el tipo de video...[/bold yellow]", spinner="dots"):
+                trans_text_for_classification = self.build_transcript_string(transcriptions)
+                video_type = classify_video_content(
+                    video_path=str(final_mp4),
+                    transcript_text=trans_text_for_classification,
+                    video_title=title
+                )
+            self.console.print(f"✅ Video clasificado como: [bold green]{video_type}[/bold green]")
+
+            # --- 3. Highlight Selection (runs once) ---
+            self.hr("Selección de Highlights (LLM)")
+            with self.console.status("[bold yellow]Seleccionando los mejores highlights con IA...[/bold yellow]", spinner="dots"):
+                highlights = get_highlights(transcriptions)
             
-            if not (isinstance(start_sec, (int, float)) and isinstance(end_sec, (int, float)) and end_sec > start_sec):
-                self.logger.error(f"[bold red]Ventana de highlight inválida: start={start_sec}, end={end_sec}[/bold red]")
+            if not highlights:
+                self.logger.error("[bold red]No se encontraron highlights válidos. Abortando.[/bold red]")
                 return
-            self.console.print(f"🎯 Highlight seleccionado: [green]{start_sec:.2f}s → {end_sec:.2f}s[/green]")
+            self.console.print(f"✅ Se encontraron [bold green]{len(highlights)}[/bold green] highlights para procesar.")
 
-            self.hr("Generación de Metadatos del Video (LLM)")
-            with self.console.status("[bold yellow]Generando metadatos con IA...[/bold yellow]", spinner="dots"):
-                highlight_text = self.extract_highlight_text(transcriptions, start_sec, end_sec)
-                metadata = generate_video_metadata(highlight_text)
-            
-            metadata_path = odir / "metadata.json"
-            with open(metadata_path, "w", encoding="utf-8") as f:
-                json.dump(metadata, f, indent=4, ensure_ascii=False)
-            
-            metadata_panel = Panel(
-                f"[bold]Title:[/bold] {metadata.get('title', 'N/A')}\n"
-                f"[bold]Description:[/bold] {metadata.get('description', 'N/A')}\n"
-                f"[bold]Hashtags:[/bold] {' '.join(metadata.get('hashtags', []))}",
-                title="[bold cyan]Metadatos Generados[/bold cyan]",
-                border_style="cyan",
-                expand=False
-            )
-            self.console.print(metadata_panel)
-            self.console.print(f"✅ Metadatos guardados en: [green]{metadata_path}[/green]")
+            # --- 4. Processing Loop (runs for each highlight) ---
+            for i, highlight in enumerate(highlights):
+                start_sec = highlight["start"]
+                end_sec = highlight["end"]
+                highlight_num = i + 1
+                
+                self.hr(f"Procesando Highlight #{highlight_num} ({start_sec:.2f}s → {end_sec:.2f}s)")
+                
+                # Create a dedicated output directory for this highlight
+                highlight_odir = main_odir / f"highlight_{highlight_num}"
+                highlight_odir.mkdir(exist_ok=True)
 
-            self.hr("Recorte Preciso del Video")
-            cut_path = wdir / "cut.mp4"
-            with self.console.status("[bold yellow]Recortando el video (re-codificando para precisión)...[/bold yellow]", spinner="dots"):
-                trim_video_ffmpeg(
-                    src=str(final_mp4),
-                    dst=str(cut_path),
-                    start=float(start_sec),
-                    end=float(end_sec),
-                    copy=False
-                )
-            self.console.print(f"✅ Video recortado en: [green]{cut_path}[/green]")
+                # --- Metadata Generation ---
+                with self.console.status(f"[bold yellow]#{highlight_num}: Generando metadatos...[/bold yellow]", spinner="dots"):
+                    highlight_text = self.extract_highlight_text(transcriptions, start_sec, end_sec)
+                    metadata = generate_video_metadata(highlight_text)
+                
+                metadata_path = highlight_odir / "metadata.json"
+                with open(metadata_path, "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, indent=4, ensure_ascii=False)
+                self.console.print(f"✅ #{highlight_num}: Metadatos guardados.")
 
-            self.hr("Cámara Virtual (Crop 9:16 + Seguimiento)")
-            cropped_path = wdir / "cropped.mp4"
-            with self.console.status("[bold yellow]Aplicando cámara virtual y recorte 9:16...[/bold yellow]", spinner="dots"):
-                crop_follow_face_1080x1920_yolo(
-                    input_path=str(cut_path),
-                    output_path=str(cropped_path),
-                    speech_json=str(speech_json_path),
-                    static_per_speaker=True,
-                    highlight_start_sec=float(start_sec) # Pass the highlight start time
-                )
-            self.console.print(f"✅ Clip recortado con cámara virtual: [green]{cropped_path}[/green]")
+                # --- Video Trimming ---
+                cut_path = wdir / f"cut_{highlight_num}.mp4"
+                with self.console.status(f"[bold yellow]#{highlight_num}: Recortando video...[/bold yellow]", spinner="dots"):
+                    trim_video_ffmpeg(
+                        src=str(final_mp4), dst=str(cut_path),
+                        start=float(start_sec), end=float(end_sec), copy=False
+                    )
+                self.console.print(f"✅ #{highlight_num}: Video recortado.")
 
-            self.hr("Muxing Final")
-            final_short = odir / "Final.mp4"
-            with self.console.status("[bold yellow]Fusionando video y audio...[/bold yellow]", spinner="dots"):
-                mux_audio_video(
-                    video_with_audio=str(cut_path),
-                    video_without_audio=str(cropped_path),
-                    dst=str(final_short),
-                    fps=30
-                )
-            self.console.print(f"✅ Short (sin subtítulos) listo en: [green]{final_short}[/green]")
+                # --- Virtual Camera / Cropping ---
+                final_short_no_subs = highlight_odir / "Final.mp4"
+                if video_type in ["interview", "presentation"]:
+                    cropped_path = wdir / f"cropped_{highlight_num}.mp4"
+                    with self.console.status(f"[bold yellow]#{highlight_num}: Aplicando cámara virtual...[/bold yellow]", spinner="dots"):
+                        crop_follow_face_1080x1920_yolo(
+                            input_path=str(cut_path), output_path=str(cropped_path),
+                            speech_json=str(speech_json_path), static_per_speaker=True,
+                            highlight_start_sec=float(start_sec)
+                        )
+                    
+                    with self.console.status(f"[bold yellow]#{highlight_num}: Fusionando video y audio...[/bold yellow]", spinner="dots"):
+                        mux_audio_video(
+                            video_with_audio=str(cut_path), video_without_audio=str(cropped_path),
+                            dst=str(final_short_no_subs), fps=30
+                        )
+                    self.console.print(f"✅ #{highlight_num}: Cámara virtual aplicada.")
+                else:
+                    self.logger.info(f"#{highlight_num}: Omitiendo seguimiento de rostros para '{video_type}'.")
+                    shutil.copy(str(cut_path), str(final_short_no_subs))
+                    self.console.print(f"✅ #{highlight_num}: Usando recorte simple.")
 
-            self.hr("Generación de Subtítulos Dinámicos")
-            ass_path = odir / "subtitles.ass"
-            final_subtitled_short = odir / f"{final_short.stem}_subtitled.mp4"
-            
-            with self.console.status("[bold yellow]Generando subtítulos ASS y quemándolos en el video...[/bold yellow]", spinner="dots"):
-                generate_ass(
-                    transcriptions=transcriptions,
-                    ass_path=ass_path,
-                    start_sec=start_sec,
-                    end_sec=end_sec
-                )
-                burn_in_subtitles(
-                    video_path=final_short,
-                    subtitle_path=ass_path,
-                    output_path=final_subtitled_short
-                )
-            self.console.print(f"✅ Short final con subtítulos dinámicos en: [green]{final_subtitled_short}[/green]")
+                # --- Subtitle Generation ---
+                final_subtitled_short = highlight_odir / "Final_subtitled.mp4"
+                with self.console.status(f"[bold yellow]#{highlight_num}: Generando y quemando subtítulos...[/bold yellow]", spinner="dots"):
+                    ass_path = highlight_odir / "subtitles.ass"
+                    generate_ass(
+                        transcriptions=transcriptions, ass_path=ass_path,
+                        start_sec=start_sec, end_sec=end_sec
+                    )
+                    burn_in_subtitles(
+                        video_path=final_short_no_subs, subtitle_path=ass_path,
+                        output_path=final_subtitled_short
+                    )
+                self.console.print(f"✅ [bold green]Highlight #{highlight_num} completado:[/bold green] {final_subtitled_short}")
 
         except KeyboardInterrupt:
             self.console.print("\n[bold yellow]Proceso interrumpido por el usuario.[/bold yellow]")
         except Exception as e:
             self.logger.exception("[bold red]¡Ha ocurrido un error fatal![/bold red]")
-            self.console.print(f"[bold red]Error: {e}[/bold red]")
 
     def hr(self, title: str):
         self.console.print(Panel(f"[bold blue]{title}", expand=False, border_style="blue"))
@@ -218,9 +223,12 @@ class VideoProcessingPipeline:
         """Extracts the text of the highlighted segment from the transcriptions."""
         highlight_text = []
         for segment in transcriptions:
-            for word_info in segment.get("words", []):
-                if start_sec <= word_info['start'] and word_info['end'] <= end_sec:
-                    highlight_text.append(word_info['word'])
+            # This logic can be improved for more precise text extraction based on word timestamps
+            seg_start, seg_end = segment.get('start', 0), segment.get('end', 0)
+            if max(start_sec, seg_start) < min(end_sec, seg_end): # Check for overlap
+                for word_info in segment.get("words", []):
+                    if start_sec <= word_info['start'] and word_info['end'] <= end_sec:
+                        highlight_text.append(word_info['word'])
         return " ".join(highlight_text)
 
 if __name__ == '__main__':
