@@ -1,18 +1,18 @@
 # AI Shorts Generator 🎬🤖
 
-> Generador automático de **YouTube Shorts** a partir de videos largos usando Whisper, OpenAI GPT y OpenCV/FFmpeg. Convierte entrevistas o podcasts en clips atractivos en formato vertical listos para subir a TikTok, Reels y Shorts.
+> Generador automático de **YouTube Shorts** a partir de videos largos usando `faster-whisper`, **Google Gemini** y OpenCV/FFmpeg. Convierte entrevistas, conferencias o cualquier video largo en múltiples clips atractivos y listos para subir a TikTok, Reels y Shorts.
 
 ---
 
-## ✨ Características Destacadas (v0.1)
+## ✨ Características Destacadas (v0.2)
 
 - 📥 **Descarga de Video:** Soporte para YouTube y otras fuentes.
-- 🎙️ **Transcripción Precisa:** Transcripción automática con `faster-whisper` y timestamps a nivel de palabra.
-- 🧠 **Selección Inteligente:** Uso de **GPT-4** para identificar segmentos "virales".
-- 🗣️ **Diarización de Hablantes:** Detección de quién habla y cuándo.
-- 🎥 **Cámara Virtual Inteligente:** Pan/zoom dinámico o encuadres fijos por hablante con transiciones suaves.
+- 🎙️ **Transcripción Precisa:** Transcripción automática con `faster-whisper`, timestamps a nivel de palabra y detección automática de idioma.
+- 🧠 **Clasificación de Contenido:** Usa un modelo multimodal (Gemini) para analizar el video y el audio, clasificándolo como `entrevista`, `presentación` o `contenido general` para adaptar la edición.
+- 💡 **Generación de Múltiples Highlights:** Identifica los 3 momentos más interesantes de tu video y genera un clip para cada uno, en lugar de solo uno.
+- 🗣️ **Diarización de Hablantes (Opcional):** Detección de quién habla y cuándo para un control de cámara más preciso en entrevistas.
+- 🎥 **Cámara Virtual Inteligente:** Pan/zoom dinámico o encuadres fijos por hablante para videos de entrevistas y presentaciones.
 - 🔥 **Subtítulos Dinámicos:** Generación automática en `.ass` con sincronización por pausas y estilo viral.
-- 🐳 **Soporte Docker:** Para despliegue en cualquier entorno.
 
 ---
 
@@ -22,7 +22,8 @@
 
 - **Python 3.8+**
 - **FFmpeg** instalado y accesible desde la terminal (`ffmpeg -version`)
-- **Cuenta de OpenAI** y API Key activa
+- **Cuenta de Google** con una API Key de **Gemini** activa.
+- **(Opcional) Cuenta de Hugging Face** con un token de acceso para la diarización de hablantes.
 
 ### ⚙️ Instalación
 
@@ -39,8 +40,13 @@ venv\Scripts\activate    # Windows
 # 3. Instalar dependencias
 pip install -r requirements.txt
 
-# 4. Configurar API Key de OpenAI
-# (Crea un archivo .env a partir de .env.example y añade tu API key)
+# 4. Configurar Claves de API
+# Crea un archivo .env en la raíz del proyecto y añade tus claves:
+
+GEMINI_API_KEY="AIzaSy..."
+
+# Opcional, para diarización de hablantes
+HUGGINGFACE_TOKEN="hf_..."
 ```
 
 ### ▶️ Uso
@@ -57,16 +63,23 @@ Luego, introduce la URL del video de YouTube cuando se te solicite.
 
 ## 📂 Estructura de Salida
 
-Cada video procesado genera una carpeta en el directorio `out/` con la siguiente estructura:
+Cada video procesado genera una carpeta principal. Dentro, encontrarás una subcarpeta para cada highlight generado:
 
 ```
 out/
 └── <nombre_del_video>/
-    ├── Final.mp4               # Video vertical sin subtítulos
-    ├── Final_subtitled.mp4     # ✅ Video final con subtítulos incrustados
-    └── subtitles.ass           # Archivo de subtítulos dinámicos
+    ├── highlight_1/
+    │   ├── Final_subtitled.mp4     # ✅ Video final con subtítulos
+    │   ├── Final.mp4               # Video sin subtítulos
+    │   ├── metadata.json           # Título, descripción y hashtags generados
+    │   └── subtitles.ass           # Archivo de subtítulos
+    │
+    ├── highlight_2/
+    │   └── ...
+    │
+    └── ...
 ```
-Adicionalmente, la carpeta `work/` contiene archivos intermedios como el audio, la transcripción completa (`speech.json`), etc., que se mantienen para facilitar el debugging y el seguimiento del flujo de trabajo.
+La carpeta `work/` contiene archivos intermedios (audio, transcripción completa, etc.) para facilitar el debugging.
 
 ---
 
