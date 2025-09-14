@@ -5,11 +5,22 @@ import sys
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from Components.common_ffmpeg import run_ffmpeg_with_progress, _ffmpeg_path
 from Components.common_utils import ensure_parent_directory_exists
 
-def extract_audio_wav(src: str, wav: str, sr: int = 16000):
+if TYPE_CHECKING:
+    from rich.progress import Progress, TaskID
+
+
+def extract_audio_wav(
+    src: str, 
+    wav: str, 
+    sr: int = 16000,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
+):
     """
     Extrae WAV mono 16k del contenedor de origen (mp4/m4a/webm/etc).
     """
@@ -23,11 +34,21 @@ def extract_audio_wav(src: str, wav: str, sr: int = 16000):
         "-sample_fmt", "s16",
         wav
     ]
-    # No hace falta % aquí (suele ser muy rápido), pero si quieres:
-    run_ffmpeg_with_progress(cmd, total_duration=None, label="Audio->WAV")
+    run_ffmpeg_with_progress(cmd, total_duration=None, label="Audio->WAV", progress=progress, task_id=task_id)
 
-def trim_video_ffmpeg(src: str, dst: str, start: float, end: float, fps: int = 30,
-                      v_bitrate: str = "6M", a_bitrate: str = "160k", copy: bool = False):
+
+def trim_video_ffmpeg(
+    src: str, 
+    dst: str, 
+    start: float, 
+    end: float, 
+    fps: int = 30,
+    v_bitrate: str = "6M", 
+    a_bitrate: str = "160k", 
+    copy: bool = False,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
+):
     """
     Recorta [start, end] del src.
     - copy=True: usa -c copy (muy rápido) si contenedor/codec lo permite.
@@ -36,6 +57,13 @@ def trim_video_ffmpeg(src: str, dst: str, start: float, end: float, fps: int = 3
     ff = _ffmpeg_path()
     ensure_parent_directory_exists(dst)
     duration = max(0.0, end - start)
+    
+    common_params = {
+        "total_duration": duration,
+        "progress": progress,
+        "task_id": task_id
+    }
+
     if copy:
         cmd = [
             ff, "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", src,
@@ -43,10 +71,10 @@ def trim_video_ffmpeg(src: str, dst: str, start: float, end: float, fps: int = 3
             "-avoid_negative_ts", "make_zero",
             dst
         ]
-        run_ffmpeg_with_progress(cmd, total_duration=duration, label="Trim(copy)")
+        run_ffmpeg_with_progress(cmd, label="Trim(copy)", **common_params)
         return
 
-    # Re-encode (sin filtros pesados aquí; el crop/scale lo hará FaceCrop)
+    # Re-encode
     cmd = [
         ff, "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", src,
         "-r", str(fps),
@@ -58,4 +86,4 @@ def trim_video_ffmpeg(src: str, dst: str, start: float, end: float, fps: int = 3
         "-avoid_negative_ts", "make_zero",
         dst
     ]
-    run_ffmpeg_with_progress(cmd, total_duration=duration, label="Trim(encode)")
+    run_ffmpeg_with_progress(cmd, label="Trim(encode)", **common_params)

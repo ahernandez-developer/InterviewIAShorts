@@ -73,6 +73,18 @@ El proyecto ha evolucionado. La fase de inteligencia de contenido se ha completa
         - Desarrollar un **paneo anticipatorio** que mueva la cámara lentamente hacia el próximo hablante *antes* de que intervenga.
         - Implementar una **duración de transición dinámica** que se adapte al ritmo de la conversación (transiciones rápidas para diálogos ágiles, lentas para pausas reflexivas).
 
+### v0.2.1 - Estabilidad y Mejoras de UX (Completada)
+
+Esta versión se centró en resolver errores críticos y mejorar la experiencia de usuario a través de barras de progreso más fiables y consistentes.
+
+- [x] **Robustez en la Transcripción:** Se corrigió el paso de argumentos a `transcribeAudio` para asegurar el uso correcto del tamaño del modelo y la ruta de guardado del JSON de voz, eliminando `NameError`s.
+- [x] **Flujo de Generación de Metadatos Refinado:** Se ajustó la llamada a `generate_video_metadata`, moviéndola al bucle de procesamiento de highlights y asegurando que reciba el texto de highlight correcto, resolviendo `TypeError`s y alineándose con la estrategia de metadatos por highlight.
+- [x] **Barras de Progreso Precisas y Consistentes:**
+    - Se habilitó el reporte de progreso exacto para las operaciones de muxing de `ffmpeg` calculando y pasando correctamente la `total_duration` a `run_ffmpeg_with_progress`.
+    - Se mejoró el parseo del progreso de `ffmpeg` en `run_ffmpeg_with_progress` para incluir el formato de salida `time=`, lo que resulta en actualizaciones más frecuentes y fiables.
+    - Se estandarizó el estilo de las barras de progreso reemplazando `tqdm` por `rich.progress` en el paso de renderizado de video, ofreciendo una experiencia de usuario uniforme.
+- [x] **Gestión de Dependencias:** Se aseguró la importación correcta de `run_ffmpeg_with_progress` en `Components/FaceCropYOLO.py` para resolver `NameError`s.
+
 (... El resto del roadmap futuro se mantiene ...)
 
 ---

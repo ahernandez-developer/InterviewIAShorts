@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.logging import RichHandler
-
+from rich.progress import Progress
 from Components.YoutubeDownloader import get_video_streams, download_and_merge
 from Components.common_utils import create_safe_filename
 from Components.Edit import extract_audio_wav, trim_video_ffmpeg
@@ -59,135 +59,118 @@ class VideoProcessingPipeline:
             base_name = create_safe_filename(title, max_len=28)
             video_output_dir = self.ROOT / "videos" / base_name
 
-            with self.console.status("[bold yellow]Descargando y fusionando video...[/bold yellow]", spinner="dots"):
-                final_path_str = download_and_merge(yt, vstream, video_output_dir)
-            
-            if not final_path_str or not Path(final_path_str).exists():
-                self.logger.error("[bold red]No se pudo descargar el video.[/bold red]")
-                return
+            with Progress(console=self.console) as progress:
+                download_task = progress.add_task("[yellow]Descargando y fusionando video...[/yellow]", total=None)
+                final_path_str = download_and_merge(yt, vstream, video_output_dir, progress, download_task)
+                # progress.remove_task(download_task) # Remove the download task once done
 
-            final_mp4 = Path(final_path_str)
-            wdir, main_odir = self.make_project_dirs(final_mp4)
-            self.console.print(f"✅ Video descargado en: [green]{final_mp4}[/green]")
-            self.logger.info(f"Directorio de trabajo: [cyan]{wdir}[/cyan]")
-            self.logger.info(f"Directorio de salida principal: [cyan]{main_odir}[/cyan]")
+                final_mp4 = Path(final_path_str)
+                wdir, main_odir = self.make_project_dirs(final_mp4)
 
-            # --- 2. Analysis (runs once) ---
-            self.hr("Análisis de Contenido")
-            
-            # Audio Extraction
-            wav_path = wdir / "audio.wav"
-            if not wav_path.exists():
-                with self.console.status("[bold yellow]Extrayendo audio a WAV...[/bold yellow]", spinner="dots"):
-                    extract_audio_wav(src=str(final_mp4), wav=str(wav_path))
-                self.console.print("✅ Audio extraído.")
-            else:
-                self.console.print("✅ Audio ya extraído.")
+                # --- 2. Transcribe Audio (runs once) ---
+                self.hr("Transcribiendo Audio")
+                audio_path = wdir / "audio.wav"
+                speech_json_path = wdir / "speech.json"
+                
+                progress.update(download_task, description="[yellow]Extrayendo audio...[/yellow]")
+                extract_audio_wav(str(final_mp4), str(audio_path))
+                
+                transcribe_task = progress.add_task("[bold yellow]Transcribiendo audio con Whisper...[/bold yellow]", total=100)
+                transcriptions = transcribeAudio(str(audio_path), progress=progress, task_id=transcribe_task, write_speech_json_to=str(speech_json_path))
+                progress.update(transcribe_task, completed=100, description="✅ Audio transcrito.")
+                progress.remove_task(transcribe_task)
 
-            # Transcription
-            speech_json_path = wdir / "speech.json"
-            if not speech_json_path.exists():
-                with self.console.status("[bold yellow]Transcribiendo audio...[/bold yellow]", spinner="dots"):
-                    transcriptions = transcribeAudio(
-                        str(wav_path), model_size="medium", language=None, beam_size=1,
-                        vad_filter=True, diarization="auto", write_speech_json_to=str(speech_json_path),
-                    )
-                self.console.print("✅ Transcripción completada.")
-            else:
-                with open(speech_json_path, "r", encoding="utf-8") as f:
-                    transcriptions = json.load(f)
-                self.console.print("✅ Transcripción cargada desde archivo.")
+                # --- 3. Content Classification (runs once) ---
+                self.hr("Clasificación de Contenido (LLM)")
+                classify_task = progress.add_task("[bold yellow]Clasificando tipo de contenido con IA...[/bold yellow]", total=100)
+                video_type = classify_video_content(str(final_mp4), transcriptions, title)
+                progress.update(classify_task, completed=100, description=f"✅ Contenido clasificado como: [bold green]{video_type}[/bold green]")
+                progress.remove_task(classify_task)
 
-            if not transcriptions:
-                self.logger.error("[bold red]La transcripción no devolvió resultados.[/bold red]")
-                return
-
-            # Content Classification
-            with self.console.status("[bold yellow]Clasificando el tipo de video...[/bold yellow]", spinner="dots"):
-                trans_text_for_classification = self.build_transcript_string(transcriptions)
-                video_type = classify_video_content(
-                    video_path=str(final_mp4),
-                    transcript_text=trans_text_for_classification,
-                    video_title=title
-                )
-            self.console.print(f"✅ Video clasificado como: [bold green]{video_type}[/bold green]")
-
-            # --- 3. Highlight Selection (runs once) ---
+                # --- 5. Highlight Selection (runs once) ---
             self.hr("Selección de Highlights (LLM)")
-            with self.console.status("[bold yellow]Seleccionando los mejores highlights con IA...[/bold yellow]", spinner="dots"):
-                highlights = get_highlights(transcriptions)
+            
+            highlight_selection_task = progress.add_task("[bold yellow]Seleccionando los mejores highlights con IA...[/bold yellow]", total=100)
+            highlights = get_highlights(transcriptions)
+            progress.update(highlight_selection_task, completed=100, description="✅ Highlights seleccionados.")
+            progress.remove_task(highlight_selection_task)
             
             if not highlights:
                 self.logger.error("[bold red]No se encontraron highlights válidos. Abortando.[/bold red]")
                 return
             self.console.print(f"✅ Se encontraron [bold green]{len(highlights)}[/bold green] highlights para procesar.")
 
-            # --- 4. Processing Loop (runs for each highlight) ---
+            # --- 6. Processing Loop (runs for each highlight) ---
             for i, highlight in enumerate(highlights):
-                start_sec = highlight["start"]
-                end_sec = highlight["end"]
-                highlight_num = i + 1
-                
-                self.hr(f"Procesando Highlight #{highlight_num} ({start_sec:.2f}s → {end_sec:.2f}s)")
-                
-                # Create a dedicated output directory for this highlight
-                highlight_odir = main_odir / f"highlight_{highlight_num}"
-                highlight_odir.mkdir(exist_ok=True)
+                    start_sec = highlight["start"]
+                    end_sec = highlight["end"]
+                    highlight_num = i + 1
+                    
+                    # Create a task for the current highlight
+                    highlight_task = progress.add_task(f"[bold magenta]Procesando Highlight #{highlight_num} ({start_sec:.2f}s → {end_sec:.2f}s)[/bold magenta]", total=100) # Total can be estimated or set to None
 
-                # --- Metadata Generation ---
-                with self.console.status(f"[bold yellow]#{highlight_num}: Generando metadatos...[/bold yellow]", spinner="dots"):
+                    self.hr(f"Procesando Highlight #{highlight_num} ({start_sec:.2f}s → {end_sec:.2f}s)")
+                    
+                    # Create a dedicated output directory for this highlight
+                    highlight_odir = main_odir / f"highlight_{highlight_num}"
+                    highlight_odir.mkdir(exist_ok=True)
+
+                    # --- Metadata Generation ---
+                    progress.update(highlight_task, description=f"[bold yellow]#{highlight_num}: Generando metadatos...[/bold yellow]", completed=10)
                     highlight_text = self.extract_highlight_text(transcriptions, start_sec, end_sec)
                     metadata = generate_video_metadata(highlight_text)
-                
-                metadata_path = highlight_odir / "metadata.json"
-                with open(metadata_path, "w", encoding="utf-8") as f:
-                    json.dump(metadata, f, indent=4, ensure_ascii=False)
-                self.console.print(f"✅ #{highlight_num}: Metadatos guardados.")
+                    metadata_path = highlight_odir / "metadata.json"
+                    with open(metadata_path, "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, indent=4, ensure_ascii=False)
+                    progress.update(highlight_task, description=f"✅ #{highlight_num}: Metadatos guardados.", completed=20)
 
-                # --- Video Trimming ---
-                cut_path = wdir / f"cut_{highlight_num}.mp4"
-                with self.console.status(f"[bold yellow]#{highlight_num}: Recortando video...[/bold yellow]", spinner="dots"):
+                    # --- Video Trimming ---
+                    cut_path = wdir / f"cut_{highlight_num}.mp4"
+                    progress.update(highlight_task, description=f"[bold yellow]#{highlight_num}: Recortando video...[/bold yellow]", completed=30)
                     trim_video_ffmpeg(
                         src=str(final_mp4), dst=str(cut_path),
                         start=float(start_sec), end=float(end_sec), copy=False
                     )
-                self.console.print(f"✅ #{highlight_num}: Video recortado.")
+                    progress.update(highlight_task, description=f"✅ #{highlight_num}: Video recortado.", completed=40)
 
-                # --- Virtual Camera / Cropping ---
-                final_short_no_subs = highlight_odir / "Final.mp4"
-                if video_type in ["interview", "presentation"]:
-                    cropped_path = wdir / f"cropped_{highlight_num}.mp4"
-                    with self.console.status(f"[bold yellow]#{highlight_num}: Aplicando cámara virtual...[/bold yellow]", spinner="dots"):
+                    # --- Virtual Camera / Cropping ---
+                    final_short_no_subs = highlight_odir / "Final.mp4"
+                    if True: # video_type in ["interview", "presentation"]:
+                        progress.update(highlight_task, description=f"[cyan]#{highlight_num}: Aplicando cámara virtual...[/cyan]", completed=50)
+                        cropped_path = wdir / f"cropped_{highlight_num}.mp4"
                         crop_follow_face_1080x1920_yolo(
                             input_path=str(cut_path), output_path=str(cropped_path),
                             speech_json=str(speech_json_path), static_per_speaker=True,
-                            highlight_start_sec=float(start_sec)
+                            highlight_start_sec=float(start_sec),
+                            progress=progress, task_id=highlight_task
                         )
-                    
-                    with self.console.status(f"[bold yellow]#{highlight_num}: Fusionando video y audio...[/bold yellow]", spinner="dots"):
+                        progress.update(highlight_task, description=f"[cyan]#{highlight_num}: Fusionando video y audio...[/cyan]", completed=70)
                         mux_audio_video(
                             video_with_audio=str(cut_path), video_without_audio=str(cropped_path),
                             dst=str(final_short_no_subs), fps=30
                         )
-                    self.console.print(f"✅ #{highlight_num}: Cámara virtual aplicada.")
-                else:
-                    self.logger.info(f"#{highlight_num}: Omitiendo seguimiento de rostros para '{video_type}'.")
-                    shutil.copy(str(cut_path), str(final_short_no_subs))
-                    self.console.print(f"✅ #{highlight_num}: Usando recorte simple.")
+                    else:
+                        self.logger.info(f"#{highlight_num}: Omitiendo seguimiento de rostros para '{video_type}'.")
+                        shutil.copy(str(cut_path), str(final_short_no_subs))
+                        self.console.print(f"✅ #{highlight_num}: Usando recorte simple.")
+                    progress.update(highlight_task, completed=80) # After cropping/muxing
 
-                # --- Subtitle Generation ---
-                final_subtitled_short = highlight_odir / "Final_subtitled.mp4"
-                with self.console.status(f"[bold yellow]#{highlight_num}: Generando y quemando subtítulos...[/bold yellow]", spinner="dots"):
+                    # --- Subtitle Generation ---
+                    final_subtitled_short = highlight_odir / "Final_subtitled.mp4"
+                    progress.update(highlight_task, description=f"[bold yellow]#{highlight_num}: Generando y quemando subtítulos...[/bold yellow]", completed=90)
                     ass_path = highlight_odir / "subtitles.ass"
                     generate_ass(
-                        transcriptions=transcriptions, ass_path=ass_path,
-                        start_sec=start_sec, end_sec=end_sec
+                        transcriptions=transcriptions,
+                        ass_path=ass_path,
+                        start_sec=start_sec,
+                        end_sec=end_sec
                     )
                     burn_in_subtitles(
                         video_path=final_short_no_subs, subtitle_path=ass_path,
                         output_path=final_subtitled_short
                     )
-                self.console.print(f"✅ [bold green]Highlight #{highlight_num} completado:[/bold green] {final_subtitled_short}")
+                    progress.update(highlight_task, description=f"✅ [bold green]Highlight #{highlight_num} completado:[/bold green] {final_subtitled_short}", completed=100)
+                    progress.remove_task(highlight_task) # Remove task once highlight is done
 
         except KeyboardInterrupt:
             self.console.print("\n[bold yellow]Proceso interrumpido por el usuario.[/bold yellow]")

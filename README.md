@@ -103,6 +103,8 @@ El desarrollo del "Generador de Shorts Virales con IA" sigue un enfoque iterativ
 
 - [x] **Consistencia en la Duración del Clip:**
     - [x] Modificar el prompt y la lógica en `LanguageTasks.py` para instruir al LLM a seleccionar un *highlight* que dure estrictamente **entre 50 y 70 segundos**.
+- [x] **Mejoras en la fiabilidad y consistencia de las barras de progreso.**
+- [x] **Corrección de errores de inicialización y flujo de datos en el pipeline.**
 - [ ] **Cámara Virtual Profesional:** Re-diseño del sistema de cámara para lograr un acabado de alta calidad, inspirado en operadores de cámara humanos.
     - [ ] **Fase 1 (Prioridad Inmediata): Movimiento Orgánico con Simulación Física:**
         - Implementar un modelo de **muelle-amortiguador (spring-damper)** para las transiciones de cámara (paneo y zoom).

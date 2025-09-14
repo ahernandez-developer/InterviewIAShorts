@@ -7,11 +7,14 @@ import json
 import math
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, TYPE_CHECKING
 
 # Transcripción (GPU si hay) con faster-whisper
 from faster_whisper import WhisperModel
-from huggingface_hub import snapshot_download  # <- NUEVO
+from huggingface_hub import snapshot_download
+
+if TYPE_CHECKING:
+    from rich.progress import Progress, TaskID
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +52,7 @@ def _format_time(s: float) -> str:
     if s is None:
         return "NA"
     m, sec = divmod(int(s), 60)
-    return f"{m:02d}:{sec:02d}"
-
-
-def _progress_bar(done: float, total: float, width: int = 30) -> str:
-    if total <= 0:
-        return ""
-    ratio = max(0.0, min(1.0, done / total))
-    done_w = int(width * ratio)
-    return f"[{'█'*done_w}{'.'*(width-done_w)}] {ratio*100:5.1f}%"
+    return f"{m:02d}:{sec:02d}" if m else f"{sec:02d}s"
 
 
 def _save_speech_json(segments: List[Dict[str, Any]], dst: Path) -> None:
@@ -76,7 +71,9 @@ def _save_speech_json(segments: List[Dict[str, Any]], dst: Path) -> None:
 
 def _try_diarization_pyannote(
     wav_path: str,
-    hf_token: Optional[str] = None
+    hf_token: Optional[str] = None,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
 ) -> Optional[List[dict]]:
     """
     Intenta diarizar el audio usando pyannote/speaker-diarization.
@@ -87,18 +84,22 @@ def _try_diarization_pyannote(
         from pyannote.audio import Pipeline
     except Exception as e:
         logger.warning(f"Pyannote no disponible ({e}); sin diarización.")
+        if progress and task_id is not None: progress.update(task_id, visible=False)
         return None
 
     token = hf_token or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
     if not token:
         logger.warning("HUGGINGFACE_TOKEN no configurado. Saltando diarización.")
+        if progress and task_id is not None: progress.update(task_id, visible=False)
         return None
 
     try:
+        if progress and task_id is not None: progress.update(task_id, description="[yellow]Diarizando (descargando modelo)...[/yellow]")
         pipe = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=token
         )
+        if progress and task_id is not None: progress.update(task_id, description="[yellow]Diarizando audio...[/yellow]")
         diar = pipe(wav_path)
 
         regions = []
@@ -110,10 +111,12 @@ def _try_diarization_pyannote(
             })
 
         regions.sort(key=lambda r: r["start"])
+        if progress and task_id is not None: progress.update(task_id, completed=100, description="[green]Diarización completada.[/green]")
         return regions
 
     except Exception as e:
         logger.warning(f"No se pudo correr diarización pyannote ({e}).")
+        if progress and task_id is not None: progress.update(task_id, visible=False)
         return None
 
 
@@ -178,7 +181,11 @@ def _merge_transcript_with_regions(
 # Descarga única y carga local del modelo (clave)
 # ------------------------------------------------------------
 
-def _ensure_model_local(model_size: str) -> Path:
+def _ensure_model_local(
+    model_size: str,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
+) -> Path:
     """
     Descarga UNA sola vez Systran/faster-whisper-<size> en models/faster-whisper-<size>
     sin symlinks (Windows-friendly). Si ya existe, no descarga nada.
@@ -190,9 +197,10 @@ def _ensure_model_local(model_size: str) -> Path:
     already = any(f.suffix == ".bin" and f.stat().st_size > 10_000_000
                   for f in local_dir.rglob("*"))
     if already:
+        if progress and task_id is not None: progress.update(task_id, completed=100, description="[green]Modelo de transcripción ya descargado.[/green]")
         return local_dir
 
-    logger.info(f"Descargando modelo {model_size} a {local_dir} (una sola vez)…")
+    if progress and task_id is not None: progress.update(task_id, description=f"[yellow]Descargando modelo {model_size} (una sola vez)…[/yellow]")
     snapshot_download(
         repo_id=f"Systran/faster-whisper-{model_size}",
         local_dir=str(local_dir),
@@ -200,6 +208,7 @@ def _ensure_model_local(model_size: str) -> Path:
         resume_download=True,
         allow_patterns=["*"],
     )
+    if progress and task_id is not None: progress.update(task_id, completed=100, description="[green]Modelo de transcripción descargado.[/green]")
     return local_dir
 
 
@@ -215,6 +224,8 @@ def transcribeAudio(
     vad_filter: bool = True,
     diarization: str = "auto",
     write_speech_json_to: Optional[str] = None,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
 ) -> List[Dict[str, Any]]: # Return type changed
     """
     Transcribe un WAV y devuelve una lista de segmentos, cada uno como un diccionario
@@ -224,10 +235,8 @@ def transcribeAudio(
     audio_dur = _probe_duration_ffprobe(wav_path)
 
     device, compute_type = _pick_device_and_compute_type()
-    model_dir = MODELS_DIR / f"faster-whisper-{model_size}"
-    model_dir.mkdir(exist_ok=True, parents=True)
+    model_dir = _ensure_model_local(model_size, progress, task_id) # Pass progress and task_id
 
-    logger.info("Transcribing audio...")
     logger.info(
         f"Audio duration: {_format_time(audio_dur)} | device={device}, "
         f"compute_type={compute_type} | lang={language or 'auto'}"
@@ -254,35 +263,25 @@ def transcribeAudio(
 
     # El generador ahora se consume en una lista para pasarlo a la diarización
     raw_segments = []
-    last_print = time.time()
-    t_load = time.time() - t0
     total_done = 0.0
 
     for seg in segments_gen:
         raw_segments.append(seg)
-        
-        # Progreso
         total_done = seg.end
-        now = time.time()
-        if audio_dur and (now - last_print) > 0.5:
-            bar = _progress_bar(total_done, audio_dur, width=28)
-            eta_s = max(
-                0.0,
-                (audio_dur - total_done) * ((now - t0 - t_load) / max(total_done, 1e-3)),
-            )
-            logger.info(f"[ASR] {bar} | {total_done:6.2f}/{audio_dur:6.2f}s | ETA {_format_time(eta_s)}")
-            last_print = now
+        if progress and task_id is not None and audio_dur:
+            progress.update(task_id, completed=total_done, total=audio_dur, description=f"[yellow]Transcribiendo audio ({_format_time(total_done)}/{_format_time(audio_dur)})...[/yellow]")
 
-    if audio_dur:
-        bar = _progress_bar(audio_dur, audio_dur, width=28)
-        logger.info(f"[ASR] {bar} | {audio_dur:6.2f}/{audio_dur:6.2f}s")
+    if progress and task_id is not None: progress.update(task_id, completed=audio_dur, description="[green]Transcripción completada.[/green]")
 
     # Diarización (si está activada)
     speech_regions: Optional[List[dict]] = None
     do_diar = (diarization or "none").lower()
     if do_diar in ("auto", "pyannote"):
+        diarization_task_id = None
+        if progress and task_id is not None:
+            diarization_task_id = progress.add_task("[yellow]Diarizando audio...[/yellow]", total=100, parent=task_id, visible=True)
         try:
-            speech_regions = _try_diarization_pyannote(wav_path)
+            speech_regions = _try_diarization_pyannote(wav_path, progress=progress, task_id=diarization_task_id)
         except Exception as e:
             logger.warning(f"Diarización fallida: {e}")
 
@@ -290,11 +289,8 @@ def transcribeAudio(
     merged_segments = _merge_transcript_with_regions(raw_segments, speech_regions)
     
     if write_speech_json_to:
-        # Usamos la función _save_speech_json original, que dumpea diccionarios.
-        # El cambio principal es que ahora merged_segments tiene la data de las palabras.
         _save_speech_json(merged_segments, Path(write_speech_json_to))
 
-    logger.info(f"Model cached at: {model_dir}")
     logger.info(f"Transcripción completada en {time.time() - t0:.1f}s")
     
     # Devolvemos la lista de diccionarios con toda la info

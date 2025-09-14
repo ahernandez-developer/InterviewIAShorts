@@ -5,15 +5,18 @@ import os
 import time
 import shutil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
 import cv2
 import torch
-from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from rich.progress import Progress, TaskID
 
 from .SystemMonitor import SystemMonitor
 from OneEuroFilter import OneEuroFilter
+from .common_ffmpeg import run_ffmpeg_with_progress
 
 # ... (El resto de los PARÁMETROS GLOBALES, HELPERS, etc. se mantienen igual)
 
@@ -73,14 +76,29 @@ class _YoloFaceDetector:
         self.device = 0 if torch.cuda.is_available() else "cpu"
         self.half = self.device != "cpu"
 
-    def detect_video(self, video_path: str) -> List[Optional[Tuple[int, int, int, int]]]:
+    def detect_video(self, video_path: str, progress: "Progress | None" = None, task_id: "TaskID | None" = None) -> List[Optional[Tuple[int, int, int, int]]]:
         results_generator = self.model.predict(
             source=video_path, stream=True, verbose=False, conf=CONF_THR,
             device=self.device, half=self.half
         )
         detections = []
         prev_cx = None
-        for results in tqdm(results_generator, desc="[Pasada 1] Detectando caras"):
+        
+        # Get total frames for progress bar
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if progress and task_id is not None:
+            progress.update(task_id, total=total_frames)
+            iterator = results_generator
+        else:
+            iterator = tqdm(results_generator, desc="[Pasada 1] Detectando caras")
+
+        for frame_idx, results in enumerate(iterator):
+            if progress and task_id is not None:
+                progress.update(task_id, completed=frame_idx + 1)
+
             if results.boxes is None or len(results.boxes) == 0:
                 detections.append(None)
                 continue
@@ -188,6 +206,8 @@ def crop_follow_face_1080x1920_yolo(
     speech_json: Optional[str] = None,
     static_per_speaker: bool = False,
     highlight_start_sec: float = 0.0,
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
 ):
     detector = _pick_detector()
     if not isinstance(detector, _YoloFaceDetector):
@@ -197,12 +217,14 @@ def crop_follow_face_1080x1920_yolo(
 
     # --- PASADA 1: DETECCIÓN ---
     monitor.start()
-    all_face_detections = detector.detect_video(input_path)
+    detection_task_id = None
+    if progress and task_id is not None:
+        detection_task_id = progress.add_task("[yellow]Detectando caras...[/yellow]", total=1, parent=task_id, visible=True)
+    all_face_detections = detector.detect_video(input_path, progress=progress, task_id=detection_task_id)
+    if progress and detection_task_id is not None: progress.update(detection_task_id, completed=100, description="[green]Detección de caras completada.[/green]")
     pass1_stats = monitor.stop()
-    print(f"[FaceCrop] Pasada 1 (Detección) completada. {pass1_stats}")
 
     # --- PASADA 2: CÁMARA Y RENDER ---
-    print("[FaceCrop] Pasada 2: Calculando cámara y renderizando...")
     monitor.start()
     cap = cv2.VideoCapture(input_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -216,9 +238,22 @@ def crop_follow_face_1080x1920_yolo(
     target_anchor_cx, target_anchor_cy, target_anchor_win_w = W / 2.0, H / 2.0, W * 0.8
     cam_x.reset_to(target_anchor_cx); cam_y.reset_to(target_anchor_cy); cam_zoom.reset_to(target_anchor_win_w)
 
+    # --- Archivo de Debug para Movimiento de Cámara ---
+    debug_log_path = Path(output_path).parent / "camera_movement.csv"
+    debug_log_file = open(debug_log_path, "w")
+    debug_log_file.write("frame,target_x,current_x,target_y,current_y,target_zoom,current_zoom\n")
+    # ----------------------------------------------------
+
     current_turn, is_searching, search_frames = -1, False, 0
 
-    for frame_idx, face_box in enumerate(tqdm(all_face_detections, desc="[Pasada 2] Renderizando video")):
+    render_task_id = None
+    if progress and task_id is not None:
+        render_task_id = progress.add_task("[cyan]Renderizando video...[/cyan]", total=len(all_face_detections), parent=task_id, visible=True)
+
+    for frame_idx, face_box in enumerate(all_face_detections):
+        if progress and render_task_id is not None:
+            progress.update(render_task_id, completed=frame_idx + 1)
+
         ok, frame = cap.read()
         if not ok: break
 
@@ -245,6 +280,12 @@ def crop_follow_face_1080x1920_yolo(
 
         current_cx, current_cy, current_win_w = cam_x.update(target_anchor_cx), cam_y.update(target_anchor_cy), cam_zoom.update(target_anchor_win_w)
 
+        # --- Guardar datos de debug ---
+        debug_log_file.write(
+            f"{frame_idx},{target_anchor_cx:.2f},{current_cx:.2f},{target_anchor_cy:.2f},{current_cy:.2f},{target_anchor_win_w:.2f},{current_win_w:.2f}\n"
+        )
+        # -----------------------------
+
         crop_w = current_win_w
         crop_h = crop_w / TARGET_ASPECT_RATIO
         if crop_w > W: crop_w, crop_h = W, W / TARGET_ASPECT_RATIO
@@ -258,19 +299,25 @@ def crop_follow_face_1080x1920_yolo(
         final_crop = cv2.resize(win, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
         writer.write(final_crop)
 
+    debug_log_file.close()
     writer.release()
     cap.release()
     pass2_stats = monitor.stop()
-    print(f"[FaceCrop] Pasada 2 (Render) completada. {pass2_stats}")
-    print("[FaceCrop] listo.")
 
 
 def mux_audio_video(video_with_audio: str, video_without_audio: str, dst: str,
-                      fps: int = 30):
-    # ... (sin cambios)
+                      fps: int = 30,
+                      progress: "Progress | None" = None,
+                      task_id: "TaskID | None" = None):
     ff = shutil.which("ffmpeg.exe" if str(Path(os.sys.executable)).lower().startswith("c:") else "ffmpeg")
     if not ff: raise RuntimeError("FFmpeg no encontrado")
     Path(dst).parent.mkdir(parents=True, exist_ok=True)
+
+    # Get total duration of the video_without_audio for progress bar
+    cap = cv2.VideoCapture(video_without_audio)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_duration = total_frames / (cap.get(cv2.CAP_PROP_FPS) or fps)
+    cap.release()
+
     cmd = [ff, "-y", "-i", video_without_audio, "-i", video_with_audio, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", str(fps), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", dst]
-    import subprocess
-    subprocess.run(cmd, check=True)
+    run_ffmpeg_with_progress(cmd, total_duration=video_duration, label="Muxing", progress=progress, task_id=task_id)

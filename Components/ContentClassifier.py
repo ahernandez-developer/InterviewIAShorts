@@ -11,7 +11,19 @@ import google.generativeai as genai
 from PIL import Image
 from pydantic import BaseModel, Field
 
+import openai
+from openai import OpenAI
+from openai import APIError, RateLimitError
+
 logger = logging.getLogger("rich")
+
+# --- OpenAI Configuration ---
+openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_client = None
+if openai_api_key:
+    openai_client = OpenAI(api_key=openai_api_key)
+else:
+    logger.warning("OPENAI_API_KEY not found in .env file. OpenAI fallback for ContentClassifier will not be available.")
 
 # --- Pydantic Schema for robust JSON output ---
 class ClassificationResponse(BaseModel):
@@ -63,7 +75,7 @@ def _extract_frames(video_path: str, num_frames: int, temp_dir: Path) -> List[Im
     
     return frames
 
-def classify_video_content(video_path: str, transcript_text: str, video_title: str) -> str:
+def classify_video_content(video_path: str, transcript_text: str, video_title: str, use_openai_fallback: bool = False) -> str:
     """
     Classifies the video content into 'interview', 'presentation', or 'general_content'
     by analyzing video frames and the transcript with a multimodal LLM.
@@ -123,7 +135,56 @@ def classify_video_content(video_path: str, transcript_text: str, video_title: s
 
             # 3. Call Gemini API
             logger.info("Sending request to Gemini for classification...")
-            response = model.generate_content(prompt_parts)
+            try:
+                response = model.generate_content(prompt_parts)
+            except Exception as e:
+                logger.error(f"Gemini API call failed for classification: {e}. Returning fallback type '{fallback_type}'.")
+                if use_openai_fallback and openai_client:
+                    logger.info("Attempting OpenAI fallback for classification...")
+                    try:
+                        # Construct OpenAI prompt (text only)
+                        system_prompt_openai = """
+                        You are an expert video content analyst. Your task is to classify a video into one of
+                        the following categories based on its title and transcript.
+                        Your response MUST be a JSON object conforming to the following Pydantic schema:
+                        {"video_type": "interview" | "presentation" | "general_content"}
+
+                        The categories are:
+                        - 'interview': A conversation between two or more people. Look for conversational turn-taking in the transcript.
+                        - 'presentation': A single person speaking to an audience (e.g., a conference talk, lecture, or monologue). Look for a single dominant speaker.
+                        - 'general_content': Anything else. This includes TV show clips, news reports, documentaries, vlogs with varied scenes, etc. This is the category if the content is not clearly an interview or a presentation.
+                        """
+                        
+                        messages = [
+                            {"role": "system", "content": system_prompt_openai},
+                            {"role": "user", "content": f"Video Title: {video_title}\nVideo Transcript (summary):\n{transcript_summary}"}
+                        ]
+                        
+                        openai_model = "gpt-3.5-turbo-1106" # Or gpt-4-turbo-preview
+                        
+                        openai_response = openai_client.chat.completions.create(
+                            model=openai_model,
+                            messages=messages,
+                            response_format={"type": "json_object"},
+                            temperature=0.7,
+                        )
+                        
+                        openai_json_str = openai_response.choices[0].message.content
+                        data = json.loads(openai_json_str)
+                        video_type = data.get("video_type")
+
+                        if video_type in ['interview', 'presentation', 'general_content']:
+                            logger.info("OpenAI fallback for classification successful.")
+                            return video_type
+                        else:
+                            logger.warning(f"OpenAI fallback returned an unknown video_type: '{video_type}'. Defaulting to '{fallback_type}'.")
+                            return fallback_type
+
+                    except (APIError, RateLimitError) as openai_e:
+                        logger.error(f"OpenAI API call failed during classification fallback: {openai_e}")
+                    except Exception as openai_e:
+                        logger.error(f"OpenAI fallback for classification failed to parse response or other error: {openai_e}")
+                return fallback_type
             
             data = json.loads(response.text)
             video_type = data.get("video_type")

@@ -5,6 +5,10 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rich.progress import Progress, TaskID
 
 def _ffmpeg_path() -> str:
     exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
@@ -19,14 +23,20 @@ def _format_eta(seconds: float) -> str:
     m, s = divmod(r, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
-def run_ffmpeg_with_progress(cmd: list[str], total_duration: float | None, label: str = "ffmpeg"):
+def run_ffmpeg_with_progress(
+    cmd: list[str], 
+    total_duration: float | None, 
+    label: str = "ffmpeg",
+    progress: "Progress | None" = None,
+    task_id: "TaskID | None" = None
+):
     """
-    Ejecuta FFmpeg con -progress pipe:1 y muestra %/ETA/speed en vivo.
-    Si total_duration es None, muestra time/speed sin %.
+    Ejecuta FFmpeg con -progress pipe:1.
+    Si se provee un objeto `rich.progress`, actualiza la tarea correspondiente.
+    De lo contrario, imprime el progreso a stdout.
     """
     ff = _ffmpeg_path()
 
-    # Si la lista ya empieza por ffmpeg, la reinyectamos con banderas; si no, las anteponemos.
     if Path(cmd[0]).name.lower().startswith("ffmpeg"):
         full = cmd[:1] + ["-hide_banner", "-y", "-progress", "pipe:1", "-loglevel", "error"] + cmd[1:]
     else:
@@ -40,7 +50,7 @@ def run_ffmpeg_with_progress(cmd: list[str], total_duration: float | None, label
     proc = subprocess.Popen(
         full,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, # Changed to PIPE
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -64,33 +74,44 @@ def run_ffmpeg_with_progress(cmd: list[str], total_duration: float | None, label
                     cur_s = ms / 1_000_000.0
                 except Exception:
                     pass
+            elif line.startswith("time="):
+                try:
+                    time_str = line.split("=", 1)[1].strip()
+                    h, m, s = map(float, time_str.split(":"))
+                    cur_s = h * 3600 + m * 60 + s
+                except Exception:
+                    pass
 
             elif line.startswith("speed="):
-                speed = line.split("=", 1)[1]
-                elapsed = time.time() - start
-
-                if total_duration and total_duration > 0:
+                speed_str = line.split("=", 1)[1]
+                
+                if progress and task_id is not None and total_duration and total_duration > 0:
                     pct = min(100.0, (cur_s / total_duration) * 100.0)
-                    # Evita spamear: imprime cada ~0.5%
-                    if pct - last_pct_print >= 0.5 or pct in (0.0, 100.0):
-                        done = max(0.001, cur_s)
-                        rate = done / max(0.001, elapsed)  # s procesados / s reales
-                        remain = max(0.0, total_duration - done)
-                        eta = remain / max(1e-6, rate)
-                        sys.stdout.write(
-                            f"\r[{label}] {pct:6.2f}% | {cur_s:7.2f}s/{total_duration:7.2f}s | ETA {_format_eta(eta)} | speed {speed:>7}"
-                        )
-                        sys.stdout.flush()
-                        last_pct_print = pct
+                    progress.update(task_id, completed=cur_s, description=f"{label} {pct:6.2f}%")
                 else:
-                    sys.stdout.write(f"\r[{label}] time {cur_s:7.2f}s | speed {speed:>7}")
-                    sys.stdout.flush()
+                    # Fallback a la impresión manual
+                    elapsed = time.time() - start
+                    if total_duration and total_duration > 0:
+                        pct = min(100.0, (cur_s / total_duration) * 100.0)
+                        if pct - last_pct_print >= 0.5 or pct in (0.0, 100.0):
+                            done = max(0.001, cur_s)
+                            rate = done / max(0.001, elapsed)
+                            remain = max(0.0, total_duration - done)
+                            eta = remain / max(1e-6, rate)
+                            sys.stdout.write(
+                                f"\r[{label}] {pct:6.2f}% | {cur_s:7.2f}s/{total_duration:7.2f}s | ETA {_format_eta(eta)} | speed {speed_str:>7}"
+                            )
+                            sys.stdout.flush()
+                            last_pct_print = pct
+                    else:
+                        sys.stdout.write(f"\r[{label}] time {cur_s:7.2f}s | speed {speed_str:>7}")
+                        sys.stdout.flush()
 
     finally:
         ret = proc.wait()
-        sys.stdout.write("\n") # Ensure newline after progress bar
-        sys.stdout.flush()
+        if not (progress and task_id):
+             sys.stdout.write("\n")
+             sys.stdout.flush()
         if ret != 0:
-            # Read stderr for error details
             stderr_output = proc.stderr.read()
             raise RuntimeError(f"FFmpeg error ({ret}). Última línea: {last_line}. Stderr: {stderr_output}")

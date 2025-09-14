@@ -124,8 +124,6 @@ def generate_ass(
             if word_buffer:
                 write_buffer(word_buffer)
 
-    print(f"✅ Dynamic ASS subtitles (by pause) generated at: {ass_path}")
-
 def burn_in_subtitles(
     video_path: str | Path,
     subtitle_path: str | Path,

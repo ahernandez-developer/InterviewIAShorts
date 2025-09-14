@@ -9,6 +9,10 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+import openai
+from openai import OpenAI
+from openai import APIError, RateLimitError
+
 load_dotenv()
 
 # --- Pydantic Schemas ---
@@ -25,16 +29,24 @@ class MetadataResponse(BaseModel):
     description: str = Field(description="A slightly longer, engaging description for the video.")
     hashtags: List[str] = Field(description="A list of relevant hashtags.")
 
+logger = logging.getLogger("rich")
+
 # --- Gemini Configuration ---
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
     raise ValueError("GEMINI_API_KEY not found in .env file.")
 genai.configure(api_key=gemini_api_key)
 
-logger = logging.getLogger("rich")
+# --- OpenAI Configuration ---
+openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_client = None
+if openai_api_key:
+    openai_client = OpenAI(api_key=openai_api_key)
+else:
+    logger.warning("OPENAI_API_KEY not found in .env file. OpenAI fallback will not be available.")
 
 # --- Helper Functions ---
-def _call_gemini_api(prompt: str, response_schema: Type[BaseModel], model_name: str = "gemini-1.5-flash") -> Dict[str, Any] | None:
+def _call_gemini_api(prompt: str, response_schema: Type[BaseModel], model_name: str = "gemini-1.5-flash", use_openai_fallback: bool = False) -> Dict[str, Any] | None:
     try:
         model = genai.GenerativeModel(
             model_name,
@@ -44,9 +56,35 @@ def _call_gemini_api(prompt: str, response_schema: Type[BaseModel], model_name: 
             )
         )
         response = model.generate_content(prompt)
-        return json.loads(response.text)
+        parsed_response = response_schema.model_validate_json(response.text)
+        return parsed_response.model_dump()
     except Exception as e:
-        logger.error(f"An unexpected error occurred in _call_gemini_api: {e}")
+        logger.error(f"Gemini API call failed: {e}")
+        if use_openai_fallback and openai_client:
+            logger.info("Attempting OpenAI fallback...")
+            try:
+                messages = [
+                    {"role": "system", "content": f"You are a helpful assistant. Your response MUST be a JSON object conforming to the following Pydantic schema: {response_schema.model_json_schema()}"},
+                    {"role": "user", "content": prompt}
+                ]
+                
+                openai_model = "gpt-3.5-turbo-1106" # Or gpt-4-turbo-preview
+                
+                openai_response = openai_client.chat.completions.create(
+                    model=openai_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.7,
+                )
+                
+                openai_json_str = openai_response.choices[0].message.content
+                parsed_openai_response = response_schema.model_validate_json(openai_json_str)
+                logger.info("OpenAI fallback successful.")
+                return parsed_openai_response.model_dump()
+            except (APIError, RateLimitError) as openai_e:
+                logger.error(f"OpenAI API call failed during fallback: {openai_e}")
+            except Exception as openai_e:
+                logger.error(f"OpenAI fallback failed to parse response or other error: {openai_e}")
         return None
 
 def _adjust_highlight_duration(
@@ -124,7 +162,7 @@ def get_highlights(transcriptions: List[Dict[str, Any]], min_duration: float = 5
         logger.info(f"Requesting candidate highlights from LLM (Attempt {attempt + 1}/{max_retries})...")
         
         full_prompt = f"{system_prompt}\n\n{user_prompt_text}"
-        json_response = _call_gemini_api(full_prompt, response_schema=HighlightListResponse)
+        json_response = _call_gemini_api(full_prompt, response_schema=HighlightListResponse, use_openai_fallback=True)
 
         if json_response and isinstance(json_response, dict) and "highlights" in json_response:
             adjusted_highlights = []
@@ -141,7 +179,45 @@ def get_highlights(transcriptions: List[Dict[str, Any]], min_duration: float = 5
         else:
             logger.warning("LLM call failed or returned invalid format. Retrying...")
 
-    logger.error(f"Failed to get and adjust any valid highlights after {max_retries} attempts.")
+    logger.error(f"Failed to get and adjust any valid highlights after {max_retries} attempts. Attempting fallback.")
+
+    if all_words:
+        total_content_duration = all_words[-1]['end']
+        
+        # Calculate a central segment
+        target_duration = (min_duration + max_duration) / 2 # Aim for the middle of the allowed range
+        
+        # Ensure target_duration doesn't exceed total_content_duration
+        if target_duration > total_content_duration:
+            target_duration = total_content_duration
+
+        fallback_start_time = (total_content_duration / 2) - (target_duration / 2)
+        fallback_end_time = (total_content_duration / 2) + (target_duration / 2)
+
+        # Adjust if start_time is negative
+        if fallback_start_time < 0:
+            fallback_start_time = 0
+            fallback_end_time = target_duration
+        
+        # Adjust if end_time exceeds total_content_duration
+        if fallback_end_time > total_content_duration:
+            fallback_end_time = total_content_duration
+            fallback_start_time = total_content_duration - target_duration
+            if fallback_start_time < 0: # Ensure it doesn't go negative again
+                fallback_start_time = 0
+
+        dummy_highlight = {
+            "start_time": fallback_start_time,
+            "end_time": fallback_end_time,
+            "highlight_reason": "Fallback highlight due to LLM failure."
+        }
+        
+        adjusted_fallback = _adjust_highlight_duration(dummy_highlight, all_words, min_duration, max_duration)
+        if adjusted_fallback:
+            logger.info("Successfully generated a fallback highlight.")
+            return [adjusted_fallback]
+    
+    logger.error("Fallback also failed: no words in transcription or could not adjust.")
     return []
 
 def generate_video_metadata(highlight_text: str) -> Dict[str, Any]:
@@ -154,7 +230,7 @@ def generate_video_metadata(highlight_text: str) -> Dict[str, Any]:
     """
     
     logger.info("Requesting video metadata from LLM...")
-    json_response = _call_gemini_api(system_prompt + "\n\n" + highlight_text, response_schema=MetadataResponse)
+    json_response = _call_gemini_api(system_prompt + "\n\n" + highlight_text, response_schema=MetadataResponse, use_openai_fallback=True)
 
     if json_response and isinstance(json_response, dict):
         if "title" in json_response and "description" in json_response and "hashtags" in json_response:
